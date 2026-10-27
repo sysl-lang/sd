@@ -5,8 +5,10 @@ operating system, allocator or floating point. ISC licensed.
 
 The first backend is SPI mode: SDSC (v1/v2), SDHC and SDXC at 3.3 V, with
 512-byte sector reads/writes, CSD capacity discovery, command/data CRCs, bounded
-polling, busy handling and programming-status checks. Native SDMMC/SDIO,
-SDUC, high-speed switching and multi-block transfers are not implemented yet.
+polling, busy handling and programming-status checks. A native SD v2 backend
+now supports SDMMC host adapters with shared metadata and FAT integration. SDIO
+functions, MMC/eMMC, SDUC, high-speed switching and multi-block transfers are
+not implemented yet.
 This initial implementation is not validated on physical cards.
 
 ```hocon
