@@ -79,6 +79,7 @@ native_probe() -> int
 #if feature_fat
     var volume = mount(&c,bytes[..]).unwrap()
     var file = volume.create("NATIVE.TXT").unwrap()
-    if volume.write(&file,bytes[..]).is_err() || volume.flush().is_err() then return 3
+    val payload: [16]u8 = [0;16]
+    if volume.write(&file,payload[..]).is_err() || volume.flush().is_err() then return 3
 #endif
     0
