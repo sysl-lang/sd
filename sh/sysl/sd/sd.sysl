@@ -3,11 +3,11 @@ module sh.sysl.sd
 
 const SECTOR_SIZE: usize = 512
 
-enum BusError derives Eq, Display
+enum BusError derives Display
     Io
     Timeout
 
-enum Phase derives Eq, Display
+enum Phase derives Display
     Reset
     Initialize
     Response
@@ -37,7 +37,7 @@ enum Error derives Eq, Display
 impl From[BusError] for Error
     from(error: BusError) -> Error = Error.Bus(error)
 
-enum CardKind derives Eq, Display
+enum CardKind derives Display
     Sdsc
     Sdhc
     Sdxc

@@ -1,9 +1,8 @@
-module sh.sysl.sd.fat
+module sh.sysl.sd.spi
 @no_alloc
 #if feature_fat
 
 import sh.sysl.sd.{Error,SECTOR_SIZE}
-import sh.sysl.sd.spi.{Spi,Card}
 import sh.sysl.fat.{BlockDevice,DeviceError}
 
 private device_error(error: Error) -> DeviceError = error match

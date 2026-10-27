@@ -11,6 +11,7 @@ extern "sd_port_now_us" port_now() -> u64
 extern "sd_port_delay_us" port_delay(micros: u32)
 
 struct Transport
+end Transport
 impl Spi for Transport
     set_clock(*self, hz: u32) -> Result[unit,BusError] = if port_clock(hz) then Ok(()) else Err(BusError.Io)
     select(*self, active: bool) -> Result[unit,BusError] = if port_select(active) then Ok(()) else Err(BusError.Io)
@@ -21,7 +22,6 @@ impl Spi for Transport
     delay_us(*self, micros: u32) = port_delay(micros)
 
 #if feature_fat
-import sh.sysl.sd.fat.*
 import sh.sysl.fat.mount
 #endif
 

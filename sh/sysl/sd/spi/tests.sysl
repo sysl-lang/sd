@@ -382,7 +382,6 @@ crc_policy()
     assert(c.write_sector(0,out[..]).is_ok())
 
 #if feature_fat
-import sh.sysl.sd.fat.*
 import sh.sysl.fat.{BlockDevice,DeviceError,FatType,format,mount}
 
 @test("FAT adapter: format, mount, file write/read and flush run through actual SPI card commands")
