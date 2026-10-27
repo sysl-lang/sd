@@ -7,8 +7,7 @@ The first backend is SPI mode: SDSC (v1/v2), SDHC and SDXC at 3.3 V, with
 512-byte sector reads/writes, CSD capacity discovery, command/data CRCs, bounded
 polling, busy handling and programming-status checks. A native SD v2 backend
 now supports SDMMC host adapters with shared metadata and FAT integration. SDIO
-functions, MMC/eMMC, SDUC, high-speed switching and multi-block transfers are
-not implemented yet.
+functions, MMC/eMMC, SDUC and high-speed switching are not implemented yet.
 This initial implementation is not validated on physical cards.
 
 ```hocon
@@ -101,3 +100,11 @@ implemented. The host adapter owns DMA/cache policy and platform arbitration;
 this package has no register addresses, filesystem or OS dependency. The
 portability probes instantiate native and SPI transfers, with and without FAT,
 for all five supported freestanding probe targets.
+
+Native cards expose `read_sectors` and `write_sectors` for caller-owned buffers
+whose lengths are multiples of 512 bytes. Requests are bounded by
+`Host.max_blocks()`; single sectors retain CMD17/24, while larger chunks use
+CMD18/25 followed by CMD12, including cleanup after data errors. The optional
+FAT adapter overrides bulk block I/O to use these transfers. Failed writes may
+have committed a prefix and are never automatically retried. SPI keeps its
+existing single-sector implementation through FAT's default bulk methods.
