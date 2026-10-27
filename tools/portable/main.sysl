@@ -1,6 +1,7 @@
 @no_alloc
-import sh.sysl.sd.BusError
-import sh.sysl.sd.spi.{Spi,card}
+import sh.sysl.sd.Clock
+import sh.sysl.spi.{Device,Config,Error as BusError}
+import sh.sysl.sd.spi.{card}
 
 // Unresolved board callbacks are deliberate: this archive proves that every
 // instantiated driver path needs no OS/heap. A firmware port supplies the ABI.
@@ -12,12 +13,13 @@ extern "sd_port_delay_us" port_delay(micros: u32)
 
 struct Transport
 end Transport
-impl Spi for Transport
-    set_clock(*self, hz: u32) -> Result[unit,BusError] = if port_clock(hz) then Ok(()) else Err(BusError.Io)
+impl Device for Transport
+    configure(*self, cfg: Config) -> Result[unit,BusError] = if port_clock(cfg.hz) then Ok(()) else Err(BusError.Io)
     select(*self, active: bool) -> Result[unit,BusError] = if port_select(active) then Ok(()) else Err(BusError.Io)
     exchange(*self, byte: u8) -> Result[u8,BusError]
         var out: u8 = 0xff
         if port_exchange(byte,&out) then Ok(out) else Err(BusError.Io)
+impl Clock for Transport
     now_us(self) -> u64 = port_now()
     delay_us(*self, micros: u32) = port_delay(micros)
 

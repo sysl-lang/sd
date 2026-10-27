@@ -1,7 +1,8 @@
 module sh.sysl.sd.spi
 @tests
 
-import sh.sysl.sd.{BusError,Error,Phase,Settings,settings,CardKind}
+import sh.sysl.sd.{Clock,Error,Phase,Settings,settings,CardKind}
+import sh.sysl.spi.{Device,Config,Mode,BitOrder,Error as BusError}
 import sysl.buf.{Buf,buf_filled}
 
 // Test-only protocol peer. CRC implementations intentionally differ from the
@@ -177,10 +178,11 @@ private dispatch(c: *Fake)
         push(c,c.status)
     else response(c,4)
 
-impl Spi for Fake
-    set_clock(*self, hz: u32) -> Result[unit,BusError]
+impl Device for Fake
+    configure(*self, cfg: Config) -> Result[unit,BusError]
         assert(!self.active)
-        self.hz = hz
+        assert(cfg.mode == Mode.Mode0 && cfg.order == BitOrder.MsbFirst)
+        self.hz = cfg.hz
         Ok(())
     select(*self, active: bool) -> Result[unit,BusError]
         self.active = active
@@ -190,9 +192,6 @@ impl Spi for Fake
             self.reply_count = 0
             self.write_stage = 0
         Ok(())
-    now_us(self) -> u64 = self.time
-    delay_us(*self, micros: u32)
-        if self.tick != 0 then self.time += u64(micros)
     exchange(*self, byte: u8) -> Result[u8,BusError]
         self.time += self.tick
         self.exchanges += 1
@@ -238,6 +237,11 @@ impl Spi for Fake
                 self.reply_count = 0
                 dispatch(self)
         Ok(0xff)
+
+impl Clock for Fake
+    now_us(self) -> u64 = self.time
+    delay_us(*self, micros: u32)
+        if self.tick != 0 then self.time += u64(micros)
 
 private opened(legacy: bool = false, block: bool = true) -> Card[Fake]
     var c = card(fake(legacy,block))

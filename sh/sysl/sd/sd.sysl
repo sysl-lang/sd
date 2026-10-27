@@ -3,9 +3,12 @@ module sh.sysl.sd
 
 const SECTOR_SIZE: usize = 512
 
-enum BusError derives Display
-    Io
-    Timeout
+import sh.sysl.spi.Error as BusError
+
+// SD polling deadlines are independent of the SPI controller interface.
+trait Clock
+    now_us(self) -> u64
+    delay_us(*self, micros: u32)
 
 enum Phase derives Display
     Reset

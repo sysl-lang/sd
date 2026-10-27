@@ -3,5 +3,6 @@ optimization = "2"
 workspace = ["tools/*"]
 features { fat = [fat] }
 dependencies {
+  spi { git = "github.com/sysl-lang/spi", branch = "dev", rev = "f0ed571" }
   fat { git = "github.com/sysl-lang/fat", version = "0.1.1", optional = true }
 }

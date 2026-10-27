@@ -15,7 +15,9 @@ dependencies {
 }
 ```
 
-Implement `sh.sysl.sd.spi.Spi` for your MCU's SPI controller and chip-select pin.
+Implement `sh.sysl.spi.Device` for your MCU connection (or wrap `spi.Bus` and
+`spi.ChipSelect` with `spi.exclusive`), and implement `sh.sysl.sd.Clock` on the
+transport for SD polling deadlines.
 The platform supplies a monotonic microsecond clock and bounded hardware waits.
 Default bulk read/write methods use byte exchanges; implementations may override
 them with DMA. The driver owns the transport, uses caller buffers and keeps CS
@@ -32,7 +34,7 @@ var volume = mount(&sd,sector[..])?
 ```
 
 Enable the optional `fat` feature to implement `fat.BlockDevice` for the card.
-The core has no filesystem dependency.
+The core depends on the standalone `spi` interfaces, with no filesystem dependency.
 The adapter exposes the whole card; it does not parse partition tables. Mount an
 unpartitioned FAT volume, or supply a partition-offset block-device view for a
 partitioned card. The adapter preserves range/buffer errors

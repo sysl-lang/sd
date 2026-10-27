@@ -2,7 +2,8 @@ module sh.sysl.sd.spi
 @no_alloc
 #if feature_fat
 
-import sh.sysl.sd.{Error,SECTOR_SIZE}
+import sh.sysl.sd.{Clock,Error,SECTOR_SIZE}
+import sh.sysl.spi.Device
 import sh.sysl.fat.{BlockDevice,DeviceError}
 
 private device_error(error: Error) -> DeviceError = error match
@@ -10,7 +11,7 @@ private device_error(error: Error) -> DeviceError = error match
     Error.OutOfRange -> DeviceError.OutOfRange
     _ -> DeviceError.Io
 
-impl[B: Spi] BlockDevice for Card[B]
+impl[B: Device + Clock] BlockDevice for Card[B]
     sector_size(self) -> usize = SECTOR_SIZE
     sectors(self) -> u64 = self.information() match
         Some(info) -> info.sectors
