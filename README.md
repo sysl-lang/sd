@@ -66,3 +66,9 @@ are compile/link-input checks, not execution on those processors.
 Protocol tests use an independent test peer, command golden vectors and a
 separate CRC implementation. Benchtop card emulation and physical-card validation
 are later steps. Development uses `dev`; no release tag is published yet.
+
+Validation on October 27, 2026, using Sysl 0.7.0: 14 core-only tests and 15 tests
+with FAT enabled passed. All ten freestanding archives built successfully (the
+five targets above, each with and without FAT). This verifies protocol behavior
+against the independent peer and compilation of the instantiated APIs; physical
+cards, MCU transports and Benchtop integration have not yet been validated.
