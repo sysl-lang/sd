@@ -42,7 +42,7 @@ enum CardKind derives Eq, Display
     Sdhc
     Sdxc
 
-struct Info
+struct Info derives Eq
     kind: CardKind
     sectors: u64
     write_protected: bool

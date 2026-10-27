@@ -1,0 +1,46 @@
+@no_alloc
+import sh.sysl.sd.BusError
+import sh.sysl.sd.spi.{Spi,card}
+
+// Unresolved board callbacks are deliberate: this archive proves that every
+// instantiated driver path needs no OS/heap. A firmware port supplies the ABI.
+extern "sd_port_clock" port_clock(hz: u32) -> bool
+extern "sd_port_select" port_select(active: bool) -> bool
+extern "sd_port_exchange" port_exchange(byte: u8, into: *u8) -> bool
+extern "sd_port_now_us" port_now() -> u64
+extern "sd_port_delay_us" port_delay(micros: u32)
+
+struct Transport
+impl Spi for Transport
+    set_clock(*self, hz: u32) -> Result[unit,BusError] = if port_clock(hz) then Ok(()) else Err(BusError.Io)
+    select(*self, active: bool) -> Result[unit,BusError] = if port_select(active) then Ok(()) else Err(BusError.Io)
+    exchange(*self, byte: u8) -> Result[u8,BusError]
+        var out: u8 = 0xff
+        if port_exchange(byte,&out) then Ok(out) else Err(BusError.Io)
+    now_us(self) -> u64 = port_now()
+    delay_us(*self, micros: u32) = port_delay(micros)
+
+#if feature_fat
+import sh.sysl.sd.fat.*
+import sh.sysl.fat.mount
+#endif
+
+@export("sd_portability_probe")
+probe() -> int
+    var c = card(Transport())
+    if c.initialize().is_err() then return 1
+    var data: [512]u8
+    if c.read_sector(0,data[..]).is_err() then return 2
+    if c.write_sector(0,data[..]).is_err() || c.flush().is_err() then return 3
+#if feature_fat
+    var v = mount(&c,data[..]) match
+        Ok(v) -> v
+        Err(_) -> return 4
+    var file = v.open("/probe.bin") match
+        Ok(f) -> f
+        Err(_) -> return 5
+    var out: [512]u8
+    if v.read(&file,out[..]).is_err() then return 6
+    if v.flush().is_err() then return 7
+#endif
+    0

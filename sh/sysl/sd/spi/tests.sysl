@@ -1,0 +1,407 @@
+module sh.sysl.sd.spi
+@tests
+
+import sh.sysl.sd.{BusError,Error,Phase,Settings,settings,CardKind}
+import sysl.buf.{Buf,buf_filled}
+
+// Test-only protocol peer. CRC implementations intentionally differ from the
+// driver's: no production command, capacity or CRC helper is used here.
+private ref_crc(data: []const u8) -> u16
+    var crc: u16 = 0
+    for byte in data
+        crc ^= u16(byte) << 8
+        for bit in 0..<8 do crc = if crc & 0x8000 != 0 then (crc << 1) ^ 0x1021 else crc << 1
+    crc
+private ref_command(data: []const u8) -> u8
+    var crc: u8 = 0
+    for byte in data
+        var x = byte
+        for bit in 0..<8
+            crc <<= 1
+            if (crc ^ x) & 0x80 != 0 then crc ^= 0x12
+            x <<= 1
+    crc | 1
+
+struct Fake
+    storage: Buf[u8]
+    legacy: bool
+    block: bool
+    csd: [16]u8
+    active: bool
+    hz: u32
+    time: u64
+    tick: u64
+    exchanges: u64
+    high_clocks: u32
+    frame: [6]u8
+    frame_at: usize
+    reply: [520]u8
+    reply_at: usize
+    reply_count: usize
+    app: bool
+    idle: bool
+    init_left: u32
+    forever_idle: bool
+    absent: bool
+    echo: u32
+    ocr: u32
+    crc_on: bool
+    bad_crc: bool
+    read_token: u8
+    no_data: bool
+    reject: u8
+    status: u8
+    busy: u32
+    stuck_program: bool
+    programming: bool
+    write_at: u32
+    write_stage: u32
+    write_data: [514]u8
+    write_count: usize
+    fail_at: u64
+    response_delay: u32
+    last_read: u32
+    last_write: u32
+    block_length: u32
+    hcs: bool
+    resets: u32
+    command_error: u8
+    command_status: u8
+
+private fake(legacy: bool = false, block: bool = true, sectors: u32 = 2048) -> Fake
+    var c: [16]u8 = [0;16]
+    c[4] = 1
+    c[5] = 0x49
+    if block
+        c[0] = 0x40
+        val size = sectors / 1024 - 1
+        c[7] = u8(size >> 16)
+        c[8] = u8(size >> 8)
+        c[9] = u8(size)
+    else
+        val size = sectors / 4 - 1
+        c[6] = u8(size >> 10)
+        c[7] = u8(size >> 2)
+        c[8] = u8((size & 3) << 6)
+    c[15] = ref_command(c[..<15])
+    Fake(buf_filled(usize(sectors) * 512,0),legacy,block,c,false,0,0,1,0,0,[0;6],0,[0;520],0,0,false,true,2,false,false,0x1aa,
+        if block then 0xc0ff8000 else 0x80ff8000,false,false,0xfe,false,5,0,0,false,false,0,0,[0;514],0,0xffffffffffffffff,1,0,0,0,false,0,255,0)
+
+private push(c: *Fake, byte: u8)
+    assert(c.reply_count < c.reply.len)
+    c.reply[c.reply_count] = byte
+    c.reply_count += 1
+private response(c: *Fake, status: u8)
+    for i in 0..<c.response_delay do push(c,0xff)
+    push(c,status)
+private packet(c: *Fake, data: []const u8)
+    if c.no_data then return
+    push(c,0xff)
+    push(c,c.read_token)
+    if c.read_token != 0xfe then return
+    for byte in data do push(c,byte)
+    val crc = ref_crc(data) ^ (if c.bad_crc then 1u16 else 0)
+    push(c,u8(crc >> 8))
+    push(c,u8(crc))
+private sector(c: *Fake, arg: u32) -> Option[u32]
+    if !c.block && arg & 511 != 0 then return None
+    val at = if c.block then u64(arg) * 512 else u64(arg)
+    if at + 512 > u64(c.storage.len()) then None else Some(u32(at))
+
+private dispatch(c: *Fake)
+    val index = c.frame[0] & 63
+    assert(c.frame[5] == ref_command(c.frame[..<5]),"command CRC must be valid")
+    val arg = (u32(c.frame[1]) << 24) | (u32(c.frame[2]) << 16) | (u32(c.frame[3]) << 8) | u32(c.frame[4])
+    if index == c.command_error
+        response(c,c.command_status)
+        return
+    if index == 0
+        assert(c.high_clocks >= 74 && c.hz <= 400000)
+        c.idle = true
+        c.crc_on = false
+        c.resets += 1
+        response(c,1)
+    elif index == 8
+        response(c,if c.legacy then 5 else 1)
+        if !c.legacy
+            for shift in [24u32,16,8,0] do push(c,u8(c.echo >> shift))
+    elif index == 55
+        c.app = true
+        response(c,if c.idle then 1 else 0)
+    elif index == 41
+        assert(c.app)
+        c.app = false
+        c.hcs = arg & 0x40000000 != 0
+        if c.init_left > 0 then c.init_left -= 1
+        elif !c.forever_idle then c.idle = false
+        response(c,if c.idle then 1 else 0)
+    elif index == 58
+        response(c,0)
+        for shift in [24u32,16,8,0] do push(c,u8(c.ocr >> shift))
+    elif index == 16
+        assert(!c.block && arg == 512)
+        c.block_length = arg
+        response(c,0)
+    elif index == 59
+        c.crc_on = arg == 1
+        response(c,0)
+    elif index == 9
+        response(c,0)
+        packet(c,c.csd[..])
+    elif index == 17 || index == 24
+        sector(c,arg) match
+            None -> response(c,0x20)
+            Some(at) ->
+                response(c,0)
+                if index == 17
+                    c.last_read = arg
+                    packet(c,c.storage.view()[usize(at)..<usize(at + 512)])
+                else
+                    c.last_write = arg
+                    c.write_at = at
+                    c.write_stage = 1
+    elif index == 13
+        response(c,0)
+        push(c,c.status)
+    else response(c,4)
+
+impl Spi for Fake
+    set_clock(*self, hz: u32) -> Result[unit,BusError]
+        assert(!self.active)
+        self.hz = hz
+        Ok(())
+    select(*self, active: bool) -> Result[unit,BusError]
+        self.active = active
+        if !active
+            self.frame_at = 0
+            self.reply_at = 0
+            self.reply_count = 0
+            self.write_stage = 0
+        Ok(())
+    now_us(self) -> u64 = self.time
+    delay_us(*self, micros: u32)
+        if self.tick != 0 then self.time += u64(micros)
+    exchange(*self, byte: u8) -> Result[u8,BusError]
+        self.time += self.tick
+        self.exchanges += 1
+        if self.exchanges == self.fail_at then return Err(BusError.Io)
+        if !self.active
+            self.high_clocks += 8
+            return Ok(0xff)
+        if self.absent then return Ok(0xff)
+        if self.reply_at < self.reply_count
+            val result = self.reply[self.reply_at]
+            self.reply_at += 1
+            return Ok(result)
+        if self.busy > 0
+            self.busy -= 1
+            return Ok(0)
+        if self.programming && self.stuck_program then return Ok(0)
+        if self.write_stage == 1
+            if byte == 0xfe
+                self.write_stage = 2
+                self.write_count = 0
+            else assert(byte == 0xff)
+            return Ok(0xff)
+        if self.write_stage == 2
+            self.write_data[self.write_count] = byte
+            self.write_count += 1
+            if self.write_count == 514
+                assert(((u16(self.write_data[512]) << 8) | u16(self.write_data[513])) == ref_crc(self.write_data[..<512]),"write data CRC must be valid")
+                if self.reject == 5
+                    for i in 0usize..<512 do self.storage.set(usize(self.write_at) + i,self.write_data[i])
+                    self.busy = 2
+                    self.programming = true
+                self.reply_at = 0
+                self.reply_count = 0
+                push(self,self.reject)
+                self.write_stage = 0
+            return Ok(0xff)
+        if self.frame_at != 0 || byte & 0xc0 == 0x40
+            self.frame[self.frame_at] = byte
+            self.frame_at += 1
+            if self.frame_at == 6
+                self.frame_at = 0
+                self.reply_at = 0
+                self.reply_count = 0
+                dispatch(self)
+        Ok(0xff)
+
+private opened(legacy: bool = false, block: bool = true) -> Card[Fake]
+    var c = card(fake(legacy,block))
+    c.initialize().unwrap()
+    c
+
+@test("SPI initialization: v1/v2 SDSC and SDHC negotiate voltage, HCS, CRC, capacity and clock")
+initialization()
+    for legacy in [false,true]
+        for block in [false,true]
+            if legacy && block then continue
+            var c = opened(legacy,block)
+            val info = c.information().unwrap()
+            assert(info.sectors == 2048 && info.block_addressed() == block)
+            assert(c.bus.hcs == !legacy && c.bus.crc_on && !c.bus.active && c.bus.hz == 8000000)
+            assert(c.bus.block_length == (if block then 0u32 else 512u32))
+            assert(c.bus.resets == 1)
+
+@test("SPI sectors: exact read/write, both addressing modes, programming status and last sector")
+sector_roundtrip()
+    for block in [false,true]
+        var c = opened(false,block)
+        var bytes: [512]u8
+        for i in 0..<512 do bytes[i] = u8(i ^ (i >> 4))
+        var out: [512]u8
+        for lba in [0u64,1,2047]
+            assert(c.write_sector(lba,bytes[..]).is_ok())
+            assert(c.read_sector(lba,out[..]).is_ok())
+            assert(out == bytes && !c.bus.active && c.bus.busy == 0)
+            assert(c.bus.last_read == u32(if block then lba else lba * 512))
+            assert(c.bus.last_write == c.bus.last_read)
+        assert(c.flush().is_ok())
+
+@test("SPI validation: uninitialized card, settings, length, range and CSD write protection perform no transfer")
+validation()
+    var c = card(fake())
+    var bytes: [512]u8
+    assert(c.read_sector(0,bytes[..]) == Err(Error.NotInitialized) && c.flush() == Err(Error.NotInitialized))
+    assert(c.bus.exchanges == 0)
+    c.config.initial_hz = 400001
+    assert(c.initialize() == Err(Error.InvalidSettings) && c.bus.exchanges == 0)
+    c.config = settings()
+    c.initialize().unwrap()
+    val before = c.bus.exchanges
+    assert(c.read_sector(0,bytes[..<511]) == Err(Error.BadLength))
+    assert(c.write_sector(2048,bytes[..]) == Err(Error.OutOfRange))
+    assert(c.read_sector(0xffffffffffffffff,bytes[..]) == Err(Error.OutOfRange))
+    assert(c.bus.exchanges == before)
+    c.bus.csd[14] = 0x20
+    c.initialize().unwrap()
+    val protected_at = c.bus.exchanges
+    assert(c.write_sector(0,bytes[..]) == Err(Error.WriteProtected) && c.bus.exchanges == protected_at)
+
+@test("SPI initialization errors: echo, voltage, CCS/CSD disagreement and command errors leave CS released")
+initialization_errors()
+    for mode in 0..<5
+        var bus = fake()
+        if mode == 0 then bus.echo = 0x1ab
+        elif mode == 1 then bus.echo = 0x2aa
+        elif mode == 2 then bus.ocr = 0x40000000
+        elif mode == 3 then bus.csd[0] = 0
+        else
+            bus.command_error = 55
+            bus.command_status = 8
+        var c = card(bus)
+        val result = c.initialize()
+        if mode == 0 then assert(result == Err(Error.Echo))
+        elif mode == 1 || mode == 2 then assert(result == Err(Error.Voltage))
+        elif mode == 3 then assert(result == Err(Error.InvalidCsd))
+        else assert(result == Err(Error.Response(8)))
+        assert(!c.bus.active && c.information().is_none())
+
+@test("SPI read errors: data token, timeout, response and CRC failure release CS and permit recovery")
+read_errors()
+    for mode in 0..<4
+        var c = opened()
+        c.config.poll_limit = 16
+        if mode == 0 then c.bus.read_token = 0x0d
+        elif mode == 1 then c.bus.no_data = true
+        elif mode == 2
+            c.bus.command_error = 17
+            c.bus.command_status = 0x20
+        else c.bus.bad_crc = true
+        var out: [512]u8
+        val result = c.read_sector(0,out[..])
+        if mode == 0 then assert(result == Err(Error.ReadToken(0x0d)))
+        elif mode == 1 then assert(result == Err(Error.Timeout(Phase.ReadToken)))
+        elif mode == 2 then assert(result == Err(Error.Response(0x20)))
+        else assert(result == Err(Error.Crc))
+        assert(!c.bus.active)
+        c.bus.read_token = 0xfe
+        c.bus.no_data = false
+        c.bus.bad_crc = false
+        c.bus.command_error = 255
+        assert(c.read_sector(0,out[..]).is_ok())
+
+@test("SPI write errors: rejection, busy timeout and CMD13 programming failures are never retried")
+write_errors()
+    for mode in 0..<4
+        var c = opened()
+        c.config.poll_limit = 16
+        if mode == 0 then c.bus.reject = 0x0b
+        elif mode == 1 then c.bus.reject = 0x0d
+        elif mode == 2 then c.bus.stuck_program = true
+        else c.bus.status = 0x20
+        val bytes: [512]u8 = [0xa5;512]
+        val result = c.write_sector(1,bytes[..])
+        if mode == 0 then assert(result == Err(Error.WriteRejected(0x0b)))
+        elif mode == 1 then assert(result == Err(Error.WriteRejected(0x0d)))
+        elif mode == 2 then assert(result == Err(Error.Timeout(Phase.Program)))
+        else assert(result == Err(Error.Status(0x20)))
+        assert(!c.bus.active && c.bus.last_write == 1)
+
+@test("SPI timeouts: absent/idle card, delayed responses, frozen clock and wrapping timer are bounded")
+timeouts()
+    for mode in 0..<4
+        var bus = fake()
+        if mode == 0 then bus.absent = true
+        elif mode == 1 then bus.forever_idle = true
+        elif mode == 2 then bus.response_delay = 17
+        else
+            bus.forever_idle = true
+            bus.tick = 0
+        var config = settings()
+        config.poll_limit = 8
+        config.initialize_us = 10000
+        var c = card(bus,config)
+        val result = c.initialize()
+        assert(result == Err(Error.Timeout(if mode == 1 || mode == 3 then Phase.Initialize else Phase.Reset)))
+        assert(c.bus.exchanges < 1000 && !c.bus.active)
+    var bus = fake()
+    bus.time = 0xfffffffffffff800
+    var c = card(bus)
+    assert(c.initialize().is_ok())
+
+@test("SPI bus failure: a mid-sector error is propagated, CS is released and initialization can be retried")
+bus_failure()
+    var c = opened()
+    c.bus.fail_at = c.bus.exchanges + 64
+    var out: [512]u8
+    assert(c.read_sector(0,out[..]) == Err(Error.Bus(BusError.Io)) && !c.bus.active)
+    assert(c.initialize().is_ok() && c.read_sector(0,out[..]).is_ok())
+
+@test("SPI CRC policy: disabling data checking does not disable valid command/write CRC generation")
+crc_policy()
+    var config = settings()
+    config.check_crc = false
+    var c = card(fake(),config)
+    c.initialize().unwrap()
+    assert(!c.bus.crc_on)
+    c.bus.bad_crc = true
+    var out: [512]u8
+    assert(c.read_sector(0,out[..]).is_ok())
+    assert(c.write_sector(0,out[..]).is_ok())
+
+#if feature_fat
+import sh.sysl.sd.fat.*
+import sh.sysl.fat.{BlockDevice,DeviceError,FatType,format,mount}
+
+@test("FAT adapter: format, mount, file write/read and flush run through actual SPI card commands")
+fat_roundtrip()
+    var c = card(fake(false,true,32768))
+    c.initialize().unwrap()
+    assert(BlockDevice.sector_size(c) == 512 && BlockDevice.sectors(c) == 32768)
+    format(&c,Some(FatType.Fat16),label = "SD TEST").unwrap()
+    var scratch: [512]u8
+    var volume = mount(&c,scratch[..]).unwrap()
+    var file = volume.create("/Recorded audio.wav").unwrap()
+    val content: [1300]u8 = [0x5a;1300]
+    assert(volume.write(&file,content[..]).unwrap() == 1300)
+    volume.flush().unwrap()
+    var reopened = volume.open("/Recorded audio.wav").unwrap()
+    var readback: [1300]u8
+    assert(volume.read(&reopened,readback[..]).unwrap() == 1300 && readback == content)
+    var out: [512]u8
+    assert(BlockDevice.read(&c,32768,out[..]) == Err(DeviceError.OutOfRange))
+    assert(BlockDevice.read(&c,0,out[..<511]) == Err(DeviceError.BadLength))
+    assert(!c.bus.active)
+#endif

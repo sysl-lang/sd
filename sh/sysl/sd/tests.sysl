@@ -1,0 +1,69 @@
+module sh.sysl.sd
+@tests
+
+@test("CRC: SD command golden vectors and CCITT data vector, including empty input")
+crc_vectors()
+    assert(crc7([0x40u8,0,0,0,0]) == 0x4a)
+    assert(crc7([0x48u8,0,0,1,0xaa]) == 0x43)
+    assert(crc7([]) == 0 && crc16([]) == 0)
+    assert(crc16("123456789".bytes) == 0x31c3)
+    val ones: [512]u8 = [0xff;512]
+    assert(crc16(ones[..]) == 0x7fa1)
+
+private csd2(size: u32) -> [16]u8
+    var c: [16]u8 = [0;16]
+    c[0] = 0x40
+    c[4] = 1
+    c[5] = 0x49
+    c[7] = u8(size >> 16)
+    c[8] = u8(size >> 8)
+    c[9] = u8(size)
+    c
+
+@test("CSD v2: minimum field, SDHC/SDXC boundary, full 2TiB capacity and write protection")
+csd_capacity_v2()
+    for size in [0u32,65535,65536,0x3fffff]
+        val c = csd2(size)
+        val info = csd_info(c[..],true).unwrap()
+        assert(info.sectors == (u64(size) + 1) * 1024)
+        assert(info.bytes() == info.sectors * 512 && info.block_addressed())
+        assert(info.kind == (if size < 65536 then CardKind.Sdhc else CardKind.Sdxc))
+    var c = csd2(1)
+    assert(csd_info(c[..],false) == Err(Error.InvalidCsd))
+    c[14] = 0x10
+    assert(csd_info(c[..],true).unwrap().write_protected)
+    c[14] = 0x20
+    assert(csd_info(c[..],true).unwrap().write_protected)
+    c[14] = 0
+    c[4] = 0
+    assert(csd_info(c[..],true).unwrap().write_protected,"missing write command class is read-only")
+    c[5] = 9
+    assert(csd_info(c[..],true) == Err(Error.InvalidCsd),"read command class is required")
+
+@test("CSD v1: every legal block length/multiplier, byte addressing and malformed registers")
+csd_capacity_v1()
+    for length in 9u32..<12
+        for mult in 0u32..<8
+            var c: [16]u8 = [0;16]
+            c[4] = 1
+            c[5] = 0x40 | u8(length)
+            c[6] = 3
+            c[7] = 0xff
+            c[8] = 0xc0
+            c[9] = u8(mult >> 1)
+            c[10] = u8((mult & 1) << 7)
+            val bytes = 4096u64 << (mult + 2 + length)
+            if bytes > 2147483648
+                assert(csd_info(c[..],false) == Err(Error.InvalidCsd))
+            else
+                val info = csd_info(c[..],false).unwrap()
+                assert(info.bytes() == bytes && !info.block_addressed() && info.kind == CardKind.Sdsc)
+    var c = csd2(1)
+    c[0] = 0
+    c[5] = 0x48
+    assert(csd_info(c[..],false) == Err(Error.InvalidCsd))
+    c[0] = 0x80
+    assert(csd_info(c[..],true) == Err(Error.UnsupportedCsd(2)))
+    c[0] = 0xc0
+    assert(csd_info(c[..],true) == Err(Error.UnsupportedCsd(3)))
+    assert(csd_info(c[..<15],true) == Err(Error.BadLength))
