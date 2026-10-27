@@ -74,3 +74,28 @@ with FAT enabled passed. All ten freestanding archives built successfully (the
 five targets above, each with and without FAT). This verifies protocol behavior
 against the independent peer and compilation of the instantiated APIs; physical
 cards, MCU transports and Benchtop integration have not yet been validated.
+
+## Native SD hosts
+
+`sh.sysl.sd.native` supports native SD v2 memory-card initialization and
+single-sector reads/writes, alongside the existing SPI driver. Implement its
+allocation-free `Host` trait and `sh.sysl.sd.Clock` for a controller adapter:
+configure the bus, send commands with none/short/long/no-CRC responses, and
+transfer command-associated data with bounded timeouts. Data callbacks check
+both R1 and controller transfer errors; sector and SCR transfers receive their
+configured timeout explicitly. Native response words are MSW first.
+
+`native.card(host)` exposes the same initialize/information/read_sector/
+write_sector/sync API and optional `fat.BlockDevice` interface as SPI. It sends
+CMD0/8, CMD55/ACMD41, CMD2/3/9/7, reads SCR and negotiates four-bit mode when
+available. CSD parsing/capacity, settings, errors and the FAT block-device
+contract are shared. Host hardware supplies command/data CRC checking; the SPI
+`check_crc` setting does not disable native CRC. Writes wait for CMD13 readiness;
+accepted writes are never automatically retried.
+
+The initial native path targets SD v2 memory cards; legacy cards without CMD8,
+MMC/eMMC, SDIO functions, high-speed switching and multiblock commands are not
+implemented. The host adapter owns DMA/cache policy and platform arbitration;
+this package has no register addresses, filesystem or OS dependency. The
+portability probes instantiate native and SPI transfers, with and without FAT,
+for all five supported freestanding probe targets.

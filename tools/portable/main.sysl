@@ -65,8 +65,8 @@ impl native.Host for NativeTransport
             native.Response.Long -> 3
             native.Response.NoCrc -> 2
         if native_command(index,arg,kind,&words[0]) then Ok(words) else Err(Error.Crc)
-    read_data(*self, index: u32, arg: u32, out: []u8) -> Result[unit,Error] = if native_read(index,arg,&out[0],out.len) then Ok(()) else Err(Error.Crc)
-    write_data(*self, index: u32, arg: u32, bytes: []const u8) -> Result[unit,Error] = if native_write(index,arg,&bytes[0],bytes.len) then Ok(()) else Err(Error.Crc)
+    read_data(*self, index: u32, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error] = if native_read(index,arg,&out[0],out.len) then Ok(()) else Err(Error.Crc)
+    write_data(*self, index: u32, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[unit,Error] = if native_write(index,arg,&bytes[0],bytes.len) then Ok(()) else Err(Error.Crc)
 impl Clock for NativeTransport
     now_us(self) -> u64 = port_now()
     delay_us(*self, micros: u32) = port_delay(micros)

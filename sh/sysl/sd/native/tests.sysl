@@ -53,7 +53,7 @@ impl Host for Fake
                 if self.busy > 0 then self.busy -= 1
             _ -> assert(false,s"unexpected native command $index")
         Ok(out)
-    read_data(*self, index: u32, arg: u32, out: []u8) -> Result[unit,Error]
+    read_data(*self, index: u32, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error]
         if self.fail then return Err(Error.Crc)
         if index == 51
             assert(out.len == 8)
@@ -65,7 +65,7 @@ impl Host for Fake
             self.address = arg
             for i in 0..<512 do out[i] = self.data[i]
         Ok(())
-    write_data(*self, index: u32, arg: u32, bytes: []const u8) -> Result[unit,Error]
+    write_data(*self, index: u32, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[unit,Error]
         assert(index == 24 && bytes.len == 512)
         if self.fail then return Err(Error.Crc)
         self.address = arg

@@ -15,8 +15,8 @@ enum Response
 trait Host
     configure(*self, hz: u32, width: u32) -> Result[unit,Error]
     command(*self, index: u32, arg: u32, response: Response) -> Result[[4]u32,Error]
-    read_data(*self, index: u32, arg: u32, out: []u8) -> Result[unit,Error]
-    write_data(*self, index: u32, arg: u32, bytes: []const u8) -> Result[unit,Error]
+    read_data(*self, index: u32, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error]
+    write_data(*self, index: u32, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[unit,Error]
 
 const R1_ERRORS: u32 = 0xfdffe008
 check_status(status: u32) -> Result[unit,Error]
@@ -34,7 +34,7 @@ struct Card[H: Host + Clock]
     initialize(*self) -> Result[Info,Error]
         self.ready = false
         val c = self.config
-        if c.initial_hz < 100000 || c.initial_hz > 400000 || c.transfer_hz < c.initial_hz || c.transfer_hz > 25000000 || c.initialize_us == 0 || c.program_us == 0 || c.poll_limit == 0 then return Err(Error.InvalidSettings)
+        if c.initial_hz < 100000 || c.initial_hz > 400000 || c.transfer_hz < c.initial_hz || c.transfer_hz > 25000000 || c.initialize_us == 0 || c.read_us == 0 || c.program_us == 0 || c.poll_limit == 0 then return Err(Error.InvalidSettings)
         self.host.configure(c.initial_hz,1)?
         self.host.delay_us(1000) // at least 74 startup clocks
         self.host.command(0,0,Response.None)?
@@ -64,7 +64,7 @@ struct Card[H: Host + Clock]
         if !info.block_addressed() then check_status(self.host.command(16,512,Response.Short)?[0])?
         check_status(self.host.command(55,self.rca,Response.Short)?[0])?
         var scr: [8]u8
-        self.host.read_data(51,0,scr[..])?
+        self.host.read_data(51,0,scr[..],c.read_us)?
         if scr[0] >> 4 != 0 || scr[1] & 1 == 0 then return Err(Error.InvalidScr)
         val width: u32 = if scr[1] & 4 != 0 then 4 else 1
         if width == 4
@@ -79,11 +79,11 @@ struct Card[H: Host + Clock]
         Ok(info)
     read_sector(*self, sector: u64, out: []u8) -> Result[unit,Error]
         val address = address(self,sector,out.len)?
-        self.host.read_data(17,address,out)
+        self.host.read_data(17,address,out,self.config.read_us)
     write_sector(*self, sector: u64, bytes: []const u8) -> Result[unit,Error]
         val address = address(self,sector,bytes.len)?
         if self.info.write_protected then return Err(Error.WriteProtected)
-        self.host.write_data(24,address,bytes)?
+        self.host.write_data(24,address,bytes,self.config.program_us)?
         self.sync()
     sync(*self) -> Result[unit,Error]
         if !self.ready then return Err(Error.NotInitialized)
