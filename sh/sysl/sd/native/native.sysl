@@ -13,6 +13,7 @@ enum Response
 // Long replies are bits 127..0, MSW first, as in STM32 SDMMC RESP1..RESP4.
 // Data callbacks issue their command and check R1 plus controller data errors.
 trait Host
+    max_blocks(self) -> usize = 65535
     configure(*self, hz: u32, width: u32) -> Result[unit,Error]
     command(*self, index: u32, arg: u32, response: Response) -> Result[[4]u32,Error]
     read_data(*self, index: u32, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error]
@@ -85,6 +86,48 @@ struct Card[H: Host + Clock]
         if self.info.write_protected then return Err(Error.WriteProtected)
         self.host.write_data(24,address,bytes,self.config.program_us)?
         self.sync()
+    // Bulk transfers are bounded by the host's data-path capacity. Each native
+    // multiblock run is explicitly stopped, including after data errors. A
+    // failed run is never retried: an already written prefix may be permanent.
+    read_sectors(*self, sector: u64, out: []u8) -> Result[unit,Error]
+        span(self,sector,out.len)?
+        val maximum = self.host.max_blocks()
+        if maximum == 0 then return Err(Error.InvalidSettings)
+        var done: usize = 0
+        while done < out.len / 512
+            val left = out.len / 512 - done
+            val count = if left > maximum then maximum else left
+            val arg = address(self,sector + u64(done),512)?
+            val into = out[done * 512..<(done + count) * 512]
+            if count == 1 then self.host.read_data(17,arg,into,self.config.read_us)?
+            else
+                val result = self.host.read_data(18,arg,into,self.config.read_us)
+                val stopped = self.host.command(12,0,Response.Short)
+                result?
+                check_status(stopped?[0])?
+                self.sync()?
+            done += count
+        Ok(())
+    write_sectors(*self, sector: u64, bytes: []const u8) -> Result[unit,Error]
+        span(self,sector,bytes.len)?
+        if self.info.write_protected && bytes.len != 0 then return Err(Error.WriteProtected)
+        val maximum = self.host.max_blocks()
+        if maximum == 0 then return Err(Error.InvalidSettings)
+        var done: usize = 0
+        while done < bytes.len / 512
+            val left = bytes.len / 512 - done
+            val count = if left > maximum then maximum else left
+            val arg = address(self,sector + u64(done),512)?
+            val from = bytes[done * 512..<(done + count) * 512]
+            if count == 1 then self.host.write_data(24,arg,from,self.config.program_us)?
+            else
+                val result = self.host.write_data(25,arg,from,self.config.program_us)
+                val stopped = self.host.command(12,0,Response.Short)
+                result?
+                check_status(stopped?[0])?
+            self.sync()?
+            done += count
+        Ok(())
     sync(*self) -> Result[unit,Error]
         if !self.ready then return Err(Error.NotInitialized)
         val start = self.host.now_us()
@@ -105,3 +148,10 @@ private address[H: Host + Clock](c: *Card[H], sector: u64, length: usize) -> Res
     val address = if c.info.block_addressed() then sector else sector * 512
     if address > 0xffffffff then return Err(Error.OutOfRange)
     Ok(u32(address))
+
+private span[H: Host + Clock](c: *Card[H], sector: u64, length: usize) -> Result[unit,Error]
+    if !c.ready then return Err(Error.NotInitialized)
+    if length % 512 != 0 then return Err(Error.BadLength)
+    val count = u64(length / 512)
+    if sector > c.info.sectors || count > c.info.sectors - sector then return Err(Error.OutOfRange)
+    Ok(())

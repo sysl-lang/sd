@@ -20,6 +20,14 @@ impl[H: Host + Clock] BlockDevice for Card[H]
         self.write_sector(sector,bytes) match
             Ok(_) -> Ok(())
             Err(error) -> Err(device_error(error))
+    override read_many(*self, sector: u64, out: []u8) -> Result[unit,DeviceError]
+        self.read_sectors(sector,out) match
+            Ok(_) -> Ok(())
+            Err(error) -> Err(device_error(error))
+    override write_many(*self, sector: u64, bytes: []const u8) -> Result[unit,DeviceError]
+        self.write_sectors(sector,bytes) match
+            Ok(_) -> Ok(())
+            Err(error) -> Err(device_error(error))
     flush(*self) -> Result[unit,DeviceError]
         self.sync() match
             Ok(_) -> Ok(())
