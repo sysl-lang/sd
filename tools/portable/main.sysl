@@ -76,6 +76,8 @@ native_probe() -> int
     if c.initialize().is_err() then return 1
     var bytes: [512]u8
     if c.read_sector(0,bytes[..]).is_err() || c.write_sector(0,bytes[..]).is_err() || c.sync().is_err() then return 2
+    var bulk: [4096]u8
+    if c.read_sectors(0,bulk[..]).is_err() || c.write_sectors(0,bulk[..]).is_err() then return 4
 #if feature_fat
     var volume = mount(&c,bytes[..]).unwrap()
     var file = volume.create("NATIVE.TXT").unwrap()

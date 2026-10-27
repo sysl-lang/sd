@@ -17,12 +17,19 @@ private struct Fake
     protected: bool
     fail: bool
     address: u32
-    data: [512]u8
-private fake() -> Fake = Fake(0,0,1,0,0,0,false,false,false,false,false,false,false,0,[0;512])
+    maximum: usize
+    stops: u32
+    multi_reads: u32
+    multi_writes: u32
+    fail_data: bool
+    fail_stop: bool
+    data: [4096]u8
+private fake() -> Fake = Fake(0,0,1,0,0,0,false,false,false,false,false,false,false,0,65535,0,0,0,false,false,[0;4096])
 impl Clock for Fake
     now_us(self) -> u64 = self.now
     delay_us(*self, micros: u32) = if !self.frozen then self.now += u64(micros)
 impl Host for Fake
+    override max_blocks(self) -> usize = self.maximum
     configure(*self, hz: u32, width: u32) -> Result[unit,Error]
         assert(hz <= 25000000 && (width == 1 || width == 4))
         self.clock = hz
@@ -47,6 +54,9 @@ impl Host for Fake
                 out = [0x400e0032,0x5b590000,0x001f0000,if self.protected then 0x02402001u32 else 0x02400001u32]
             7 -> assert(arg == 0x12340000)
             6 -> assert(arg == 2)
+            12 ->
+                self.stops += 1
+                if self.fail_stop then return Err(Error.Crc)
             13 ->
                 assert(arg == 0x12340000)
                 out[0] = if self.busy > 0 then 0xe00 else 0x900
@@ -54,22 +64,24 @@ impl Host for Fake
             _ -> assert(false,s"unexpected native command $index")
         Ok(out)
     read_data(*self, index: u32, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error]
-        if self.fail then return Err(Error.Crc)
+        if index == 18 then self.multi_reads += 1
+        if self.fail || self.fail_data then return Err(Error.Crc)
         if index == 51
             assert(out.len == 8)
             for i in 0..<8 do out[i] = 0
             out[0] = if self.bad_scr then 0xf2 else 2
             out[1] = if self.one_bit then 1 else 5
         else
-            assert(index == 17 && out.len == 512)
+            assert((index == 17 || index == 18) && out.len % 512 == 0)
             self.address = arg
-            for i in 0..<512 do out[i] = self.data[i]
+            for i in 0..<out.len do out[i] = self.data[usize(arg % 8) * 512 + i]
         Ok(())
     write_data(*self, index: u32, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[unit,Error]
-        assert(index == 24 && bytes.len == 512)
-        if self.fail then return Err(Error.Crc)
+        assert((index == 24 || index == 25) && bytes.len % 512 == 0)
+        if index == 25 then self.multi_writes += 1
+        if self.fail || self.fail_data then return Err(Error.Crc)
         self.address = arg
-        for i in 0..<512 do self.data[i] = bytes[i]
+        for i in 0..<bytes.len do self.data[usize(arg % 8) * 512 + i] = bytes[i]
         self.busy = 2
         Ok(())
 
@@ -146,3 +158,40 @@ program_native()
     c.host.frozen = true
     c.config.program_us = 2000
     assert(c.sync().err() == Some(Error.Timeout(Phase.Program)))
+
+@test("native SD bulk: host-limited runs increment addresses, stop each command and preserve all sector data")
+bulk_native()
+    var bus = fake()
+    bus.maximum = 3
+    var c = card(bus)
+    c.initialize().unwrap()
+    var bytes: [4096]u8 = [0;4096]
+    for i in 0..<4096 do bytes[i] = u8(i * 13 + i / 512)
+    c.write_sectors(0,bytes[..]).unwrap()
+    assert(c.host.multi_writes == 3 && c.host.stops == 3 && c.host.address == 6)
+    var out: [4096]u8
+    c.read_sectors(0,out[..]).unwrap()
+    assert(c.host.multi_reads == 3 && c.host.stops == 6 && c.host.address == 6)
+    for i in 0..<4096 do assert(out[i] == bytes[i])
+    val calls = c.host.calls
+    assert(c.read_sectors(32768,[]).is_ok() && c.write_sectors(32768,[]).is_ok())
+    assert(c.host.calls == calls)
+    assert(c.read_sectors(32767,out[..]).err() == Some(Error.OutOfRange))
+    assert(c.write_sectors(0,bytes[..<513]).err() == Some(Error.BadLength))
+    c.host.maximum = 0
+    assert(c.read_sectors(0,out[..]).err() == Some(Error.InvalidSettings))
+
+@test("native SD bulk: stop is attempted after data failure, successful data requires stop success and writes are never retried")
+bulk_failures()
+    var c = card(fake())
+    c.initialize().unwrap()
+    c.host.fail_data = true
+    var bytes: [1024]u8 = [0;1024]
+    assert(c.write_sectors(0,bytes[..]).err() == Some(Error.Crc))
+    assert(c.host.multi_writes == 1 && c.host.stops == 1)
+    assert(c.read_sectors(0,bytes[..]).err() == Some(Error.Crc))
+    assert(c.host.stops == 2)
+    c.host.fail_data = false
+    c.host.fail_stop = true
+    assert(c.read_sectors(0,bytes[..]).err() == Some(Error.Crc))
+    assert(c.host.stops == 3)
