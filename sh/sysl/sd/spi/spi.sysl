@@ -1,0 +1,237 @@
+module sh.sysl.sd.spi
+@no_alloc
+
+import sh.sysl.sd.{BusError,Error,Phase,Info,CardKind,Settings,settings,csd_info,crc7,crc16,SECTOR_SIZE}
+
+// One exclusively owned SPI-mode card connection. The platform sets mode 0,
+// MSB first, eight-bit words, manual CS, 3.3V signaling, and suitable pin mux.
+// Each callback must have its own bounded hardware wait. The driver cannot
+// time out a callback that never returns. A shared bus needs an external lock.
+trait Spi
+    set_clock(*self, hz: u32) -> Result[unit,BusError]
+    select(*self, active: bool) -> Result[unit,BusError]
+    exchange(*self, byte: u8) -> Result[u8,BusError]
+    now_us(self) -> u64
+    delay_us(*self, micros: u32)
+
+    // Platforms can override these with bounded DMA/bulk transfers. CS must
+    // remain asserted; read transmits 0xff for every received byte.
+    read(*self, out: []u8) -> Result[unit,BusError]
+        for i in 0..<out.len do out[i] = self.exchange(0xff)?
+        Ok(())
+    write(*self, data: []const u8) -> Result[unit,BusError]
+        for byte in data do self.exchange(byte)?
+        Ok(())
+
+struct Card[B: Spi]
+    private[spi] bus: B
+    private[spi] config: Settings
+    private[spi] ready: bool
+    private[spi] info: Info
+
+    initialize(*self) -> Result[Info,Error]
+        self.ready = false
+        self.info = Info(CardKind.Sdsc,0,false)
+        val c = self.config
+        if c.initial_hz < 100000 || c.initial_hz > 400000 || c.transfer_hz < c.initial_hz || c.transfer_hz > 25000000 || c.initialize_us == 0 || c.read_us == 0 || c.program_us == 0 || c.poll_limit == 0 then return Err(Error.InvalidSettings)
+        val outcome = initialize_card(self)
+        val cleanup = release(self)
+        val info = outcome?
+        cleanup?
+        self.info = info
+        self.ready = true
+        Ok(info)
+
+    information(self) -> Option[Info] = if self.ready then Some(self.info) else None
+    into_transport(self) -> B = self.bus
+
+    read_sector(*self, sector: u64, out: []u8) -> Result[unit,Error]
+        val address = sector_address(self,sector,out.len)?
+        val outcome = read_selected(self,address,out)
+        val cleanup = release(self)
+        outcome?
+        cleanup?
+        Ok(())
+
+    write_sector(*self, sector: u64, data: []const u8) -> Result[unit,Error]
+        val address = sector_address(self,sector,data.len)?
+        if self.info.write_protected then return Err(Error.WriteProtected)
+        val outcome = write_selected(self,address,data)
+        val cleanup = release(self)
+        outcome?
+        cleanup?
+        // Busy ending alone does not report every programming error.
+        self.flush()
+
+    flush(*self) -> Result[unit,Error]
+        if !self.ready then return Err(Error.NotInitialized)
+        val outcome = status_selected(self)
+        val cleanup = release(self)
+        outcome?
+        cleanup?
+        Ok(())
+
+card[B: Spi](bus: B, config: Settings = settings()) -> Card[B] = Card(bus,config,false,Info(CardKind.Sdsc,0,false))
+
+private sector_address[B: Spi](c: *Card[B], sector: u64, length: usize) -> Result[u32,Error]
+    if !c.ready then return Err(Error.NotInitialized)
+    if length != SECTOR_SIZE then return Err(Error.BadLength)
+    if sector >= c.info.sectors then return Err(Error.OutOfRange)
+    val address = if c.info.block_addressed() then sector else sector * 512
+    if address > 0xffffffff then return Err(Error.OutOfRange)
+    Ok(u32(address))
+
+private release[B: Spi](c: *Card[B]) -> Result[unit,Error]
+    // Attempt both steps even if changing CS reports a transport failure.
+    val deselect = c.bus.select(false)
+    val clock = c.bus.exchange(0xff)
+    deselect?
+    clock?
+    Ok(())
+
+private wait_ready[B: Spi](c: *Card[B], timeout: u32, phase: Phase) -> Result[unit,Error]
+    val start = c.bus.now_us()
+    for poll in 0..<c.config.poll_limit
+        if c.bus.exchange(0xff)? == 0xff then return Ok(())
+        if c.bus.now_us() - start >= u64(timeout) then break
+    Err(Error.Timeout(phase))
+
+// Leaves CS asserted for response suffix/data. Caller always releases it.
+private command[B: Spi](c: *Card[B], index: u8, argument: u32) -> Result[u8,Error]
+    c.bus.select(true)?
+    if index != 0 then wait_ready(c,c.config.program_us,Phase.Ready)?
+    c.bus.exchange(0xff)?
+    var bytes: [6]u8 = [0x40 | index,u8(argument >> 24),u8(argument >> 16),u8(argument >> 8),u8(argument),0]
+    bytes[5] = (crc7(bytes[..<5]) << 1) | 1
+    c.bus.write(bytes[..])?
+    // Ncr is at most eight byte clocks. Allow sixteen polls for conservative
+    // controller/card timing, with a fixed finite bound even on a frozen clock.
+    for poll in 0..<16
+        val response = c.bus.exchange(0xff)?
+        if response & 0x80 == 0 then return Ok(response)
+    Err(Error.Timeout(Phase.Response))
+
+private r1[B: Spi](c: *Card[B], index: u8, argument: u32) -> Result[u8,Error]
+    val outcome = command(c,index,argument)
+    val cleanup = release(c)
+    val response = outcome?
+    cleanup?
+    Ok(response)
+
+private long_selected[B: Spi](c: *Card[B], index: u8, argument: u32) -> Result[(u8,u32),Error]
+    val response = command(c,index,argument)?
+    if response & 4 != 0 then return Ok((response,0))
+    var tail: [4]u8
+    c.bus.read(tail[..])?
+    Ok((response,(u32(tail[0]) << 24) | (u32(tail[1]) << 16) | (u32(tail[2]) << 8) | u32(tail[3])))
+
+private long_response[B: Spi](c: *Card[B], index: u8, argument: u32) -> Result[(u8,u32),Error]
+    val outcome = long_selected(c,index,argument)
+    val cleanup = release(c)
+    val response = outcome?
+    cleanup?
+    Ok(response)
+
+private expect_ready(status: u8) -> Result[unit,Error]
+    if status == 0 then Ok(()) else Err(Error.Response(status))
+
+private receive[B: Spi](c: *Card[B], out: []u8) -> Result[unit,Error]
+    val start = c.bus.now_us()
+    var token: u8 = 0xff
+    for poll in 0..<c.config.poll_limit
+        token = c.bus.exchange(0xff)?
+        if token != 0xff then break
+        if c.bus.now_us() - start >= u64(c.config.read_us) then break
+    if token == 0xff then return Err(Error.Timeout(Phase.ReadToken))
+    if token != 0xfe then return Err(Error.ReadToken(token))
+    c.bus.read(out)?
+    val high = c.bus.exchange(0xff)?
+    val low = c.bus.exchange(0xff)?
+    if c.config.check_crc && ((u16(high) << 8) | u16(low)) != crc16(out) then return Err(Error.Crc)
+    Ok(())
+
+private read_selected[B: Spi](c: *Card[B], address: u32, out: []u8) -> Result[unit,Error]
+    expect_ready(command(c,17,address)?)?
+    receive(c,out)
+
+private write_selected[B: Spi](c: *Card[B], address: u32, data: []const u8) -> Result[unit,Error]
+    expect_ready(command(c,24,address)?)?
+    c.bus.exchange(0xff)? // At least eight clocks between R1 and data token.
+    c.bus.exchange(0xfe)?
+    c.bus.write(data)?
+    val crc = crc16(data)
+    c.bus.exchange(u8(crc >> 8))?
+    c.bus.exchange(u8(crc))?
+    val start = c.bus.now_us()
+    var token: u8 = 0xff
+    for poll in 0..<c.config.poll_limit
+        token = c.bus.exchange(0xff)?
+        if token != 0xff then break
+        if c.bus.now_us() - start >= u64(c.config.program_us) then break
+    if token == 0xff then return Err(Error.Timeout(Phase.WriteResponse))
+    if token & 0x1f != 5 then return Err(Error.WriteRejected(token))
+    // The card can assert busy after the response byte; keep CS low and clock
+    // it until ready. A failed write is never automatically retried.
+    wait_ready(c,c.config.program_us,Phase.Program)
+
+private status_selected[B: Spi](c: *Card[B]) -> Result[unit,Error]
+    val first = command(c,13,0)?
+    val second = c.bus.exchange(0xff)?
+    val status = (u16(first) << 8) | u16(second)
+    if status == 0 then Ok(()) else Err(Error.Status(status))
+
+private csd_selected[B: Spi](c: *Card[B], block: bool) -> Result[Info,Error]
+    expect_ready(command(c,9,0)?)?
+    var bytes: [16]u8
+    receive(c,bytes[..])?
+    csd_info(bytes[..],block)
+
+private initialize_card[B: Spi](c: *Card[B]) -> Result[Info,Error]
+    c.bus.set_clock(c.config.initial_hz)?
+    c.bus.select(false)?
+    c.bus.delay_us(1000)
+    for i in 0..<10 do c.bus.exchange(0xff)? // 80 clocks with CS high.
+    val start = c.bus.now_us()
+    var idle = false
+    for attempt in 0..<c.config.poll_limit
+        r1(c,0,0) match
+            Ok(1) ->
+                idle = true
+                break
+            Ok(other) -> return Err(Error.Response(other))
+            Err(Error.Timeout(Phase.Response)) -> ()
+            Err(error) -> return Err(error)
+        if c.bus.now_us() - start >= u64(c.config.initialize_us) then break
+        c.bus.delay_us(1000)
+    if !idle then return Err(Error.Timeout(Phase.Reset))
+    val echo = long_response(c,8,0x1aa)?
+    val version2 = echo.0 == 1
+    if version2
+        if echo.1 & 0xff != 0xaa then return Err(Error.Echo)
+        if echo.1 & 0xfff != 0x1aa then return Err(Error.Voltage)
+    elif echo.0 != 5 then return Err(Error.Response(echo.0))
+    var ready = false
+    for attempt in 0..<c.config.poll_limit
+        val prefix = r1(c,55,0)?
+        if prefix != 1 && prefix != 0 then return Err(Error.Response(prefix))
+        val response = r1(c,41,if version2 then 0x40000000 else 0)?
+        if response == 0
+            ready = true
+            break
+        if response != 1 then return Err(Error.Response(response))
+        if c.bus.now_us() - start >= u64(c.config.initialize_us) then break
+        c.bus.delay_us(1000)
+    if !ready then return Err(Error.Timeout(Phase.Initialize))
+    val ocr = long_response(c,58,0)?
+    expect_ready(ocr.0)?
+    if ocr.1 & 0x80000000 == 0 || ocr.1 & 0x00300000 == 0 then return Err(Error.Voltage)
+    val block = ocr.1 & 0x40000000 != 0
+    if block && !version2 then return Err(Error.InvalidCsd)
+    if !block then expect_ready(r1(c,16,512)?)?
+    expect_ready(r1(c,59,if c.config.check_crc then 1 else 0)?)?
+    val outcome = csd_selected(c,block)
+    val cleanup = release(c)
+    val info = outcome?
+    cleanup?
+    c.bus.set_clock(c.config.transfer_hz)?
+    Ok(info)

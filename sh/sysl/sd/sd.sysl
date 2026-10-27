@@ -1,0 +1,108 @@
+module sh.sysl.sd
+@no_alloc
+
+const SECTOR_SIZE: usize = 512
+
+enum BusError derives Eq, Display
+    Io
+    Timeout
+
+enum Phase derives Eq, Display
+    Reset
+    Initialize
+    Response
+    Ready
+    ReadToken
+    WriteResponse
+    Program
+
+enum Error derives Eq, Display
+    Bus(error: BusError)
+    NotInitialized
+    InvalidSettings
+    BadLength
+    OutOfRange
+    WriteProtected
+    Timeout(phase: Phase)
+    Response(status: u8)
+    Voltage
+    Echo
+    UnsupportedCsd(structure: u8)
+    InvalidCsd
+    Crc
+    ReadToken(token: u8)
+    WriteRejected(token: u8)
+    Status(status: u16)
+
+impl From[BusError] for Error
+    from(error: BusError) -> Error = Error.Bus(error)
+
+enum CardKind derives Eq, Display
+    Sdsc
+    Sdhc
+    Sdxc
+
+struct Info
+    kind: CardKind
+    sectors: u64
+    write_protected: bool
+
+    bytes(self) -> u64 = self.sectors * 512
+    block_addressed(self) -> bool = self.kind != CardKind.Sdsc
+
+struct Settings
+    initial_hz: u32
+    transfer_hz: u32
+    initialize_us: u32
+    read_us: u32
+    program_us: u32
+    // Also bounds progress if a platform supplies a frozen clock.
+    poll_limit: u32
+    check_crc: bool
+
+settings() -> Settings = Settings(400000,8000000,1000000,200000,500000,1000000,true)
+
+// Register bit positions follow SD Association Physical Layer specification,
+// sections 5.3.2/5.3.3. OCR's CCS flag must agree with the CSD structure.
+csd_info(csd: []const u8, block_addressed: bool) -> Result[Info,Error]
+    if csd.len != 16 then return Err(Error.BadLength)
+    val structure = csd[0] >> 6
+    val classes = (u32(csd[4]) << 4) | (u32(csd[5]) >> 4)
+    if classes & 4 == 0 then return Err(Error.InvalidCsd)
+    val protected = csd[14] & 0x30 != 0 || classes & 16 == 0
+    if structure == 0
+        if block_addressed then return Err(Error.InvalidCsd)
+        val length = u32(csd[5] & 15)
+        if length < 9 || length > 11 then return Err(Error.InvalidCsd)
+        val size = (u32(csd[6] & 3) << 10) | (u32(csd[7]) << 2) | (u32(csd[8]) >> 6)
+        val mult = (u32(csd[9] & 3) << 1) | (u32(csd[10]) >> 7)
+        val bytes = (u64(size) + 1) << (mult + 2 + length)
+        if bytes > 2147483648 then return Err(Error.InvalidCsd)
+        return Ok(Info(CardKind.Sdsc,bytes / 512,protected))
+    if structure == 1
+        if !block_addressed || csd[5] & 15 != 9 then return Err(Error.InvalidCsd)
+        val size = (u32(csd[7] & 63) << 16) | (u32(csd[8]) << 8) | u32(csd[9])
+        val sectors = (u64(size) + 1) * 1024
+        return Ok(Info(if sectors > 67108864 then CardKind.Sdxc else CardKind.Sdhc,sectors,protected))
+    Err(Error.UnsupportedCsd(structure))
+
+// CRC7, polynomial x^7+x^3+1, initial zero. The command wire byte is
+// (crc7(header) << 1) | 1. CRC16 is CCITT, polynomial 0x1021, initial zero.
+crc7(data: []const u8) -> u8
+    var crc: u8 = 0
+    for byte in data
+        var bits = byte
+        for bit in 0..<8
+            val feedback = ((crc >> 6) ^ (bits >> 7)) & 1
+            crc = (crc << 1) & 127
+            if feedback != 0 then crc ^= 9
+            bits <<= 1
+    crc
+
+private val CRC16: [16]u16 = [0x0000,0x1021,0x2042,0x3063,0x4084,0x50a5,0x60c6,0x70e7,0x8108,0x9129,0xa14a,0xb16b,0xc18c,0xd1ad,0xe1ce,0xf1ef]
+crc16(data: []const u8) -> u16
+    var crc: u16 = 0
+    for byte in data
+        crc = (crc << 4) ^ CRC16[usize((crc >> 12) ^ u16(byte >> 4))]
+        crc = (crc << 4) ^ CRC16[usize((crc >> 12) ^ u16(byte & 15))]
+    crc
