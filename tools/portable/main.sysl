@@ -31,7 +31,7 @@ probe() -> int
     if c.initialize().is_err() then return 1
     var data: [512]u8
     if c.read_sector(0,data[..]).is_err() then return 2
-    if c.write_sector(0,data[..]).is_err() || c.flush().is_err() then return 3
+    if c.write_sector(0,data[..]).is_err() || c.sync().is_err() then return 3
 #if feature_fat
     var v = mount(&c,data[..]) match
         Ok(v) -> v

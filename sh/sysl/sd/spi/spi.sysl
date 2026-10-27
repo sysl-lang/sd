@@ -61,9 +61,9 @@ struct Card[B: Spi]
         outcome?
         cleanup?
         // Busy ending alone does not report every programming error.
-        self.flush()
+        self.sync()
 
-    flush(*self) -> Result[unit,Error]
+    sync(*self) -> Result[unit,Error]
         if !self.ready then return Err(Error.NotInitialized)
         val outcome = status_selected(self)
         val cleanup = release(self)

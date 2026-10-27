@@ -24,7 +24,7 @@ impl[B: Spi] BlockDevice for Card[B]
             Ok(_) -> Ok(())
             Err(error) -> Err(device_error(error))
     flush(*self) -> Result[unit,DeviceError]
-        Card.flush(self) match
+        self.sync() match
             Ok(_) -> Ok(())
             Err(error) -> Err(device_error(error))
 #endif

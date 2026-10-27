@@ -43,8 +43,8 @@ switches belong to the board transport. CSD write protection is enforced. SPI
 callbacks must return on hardware failure: an outer deadline cannot interrupt a
 callback that never returns. Poll-count limits additionally bound a frozen clock.
 
-Writes wait for programming completion and check CMD13 status; `flush` checks
-readiness/status again. A failed write may already have changed media and is
+Writes wait for programming completion and check CMD13 status; `sync()` checks
+readiness/status again (the FAT adapter calls it from `flush`). A failed write may already have changed media and is
 never automatically retried. Read buffers must be discarded on error. Reinitialize
 after removal or bus recovery. These guarantees do not make FAT operations atomic.
 

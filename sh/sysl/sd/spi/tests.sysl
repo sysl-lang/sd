@@ -257,13 +257,13 @@ sector_roundtrip()
             assert(out == bytes && !c.bus.active && c.bus.busy == 0)
             assert(c.bus.last_read == u32(if block then lba else lba * 512))
             assert(c.bus.last_write == c.bus.last_read)
-        assert(c.flush().is_ok())
+        assert(c.sync().is_ok())
 
 @test("SPI validation: uninitialized card, settings, length, range and CSD write protection perform no transfer")
 validation()
     var c = card(fake())
     var bytes: [512]u8
-    assert(c.read_sector(0,bytes[..]) == Err(Error.NotInitialized) && c.flush() == Err(Error.NotInitialized))
+    assert(c.read_sector(0,bytes[..]) == Err(Error.NotInitialized) && c.sync() == Err(Error.NotInitialized))
     assert(c.bus.exchanges == 0)
     c.config.initial_hz = 400001
     assert(c.initialize() == Err(Error.InvalidSettings) && c.bus.exchanges == 0)
@@ -388,7 +388,7 @@ import sh.sysl.fat.{BlockDevice,DeviceError,FatType,format,mount}
 fat_roundtrip()
     var c = card(fake(false,true,32768))
     c.initialize().unwrap()
-    assert(BlockDevice.sector_size(c) == 512 && BlockDevice.sectors(c) == 32768)
+    assert(c.sector_size() == 512 && c.sectors() == 32768)
     format(&c,Some(FatType.Fat16),label = "SD TEST").unwrap()
     var scratch: [512]u8
     var volume = mount(&c,scratch[..]).unwrap()
@@ -400,7 +400,7 @@ fat_roundtrip()
     var readback: [1300]u8
     assert(volume.read(&reopened,readback[..]).unwrap() == 1300 && readback == content)
     var out: [512]u8
-    assert(BlockDevice.read(&c,32768,out[..]) == Err(DeviceError.OutOfRange))
-    assert(BlockDevice.read(&c,0,out[..<511]) == Err(DeviceError.BadLength))
+    assert(c.read(32768,out[..]) == Err(DeviceError.OutOfRange))
+    assert(c.read(0,out[..<511]) == Err(DeviceError.BadLength))
     assert(!c.bus.active)
 #endif
