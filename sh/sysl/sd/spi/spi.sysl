@@ -8,6 +8,7 @@ import sh.sysl.sd.{BusError,Error,Phase,Info,CardKind,Settings,settings,csd_info
 // Each callback must have its own bounded hardware wait. The driver cannot
 // time out a callback that never returns. A shared bus needs an external lock.
 trait Spi
+    // Configure a rate no greater than the requested ceiling.
     set_clock(*self, hz: u32) -> Result[unit,BusError]
     select(*self, active: bool) -> Result[unit,BusError]
     exchange(*self, byte: u8) -> Result[u8,BusError]
@@ -193,7 +194,9 @@ private initialize_card[B: Spi](c: *Card[B]) -> Result[Info,Error]
     for i in 0..<10 do c.bus.exchange(0xff)? // 80 clocks with CS high.
     val start = c.bus.now_us()
     var idle = false
-    for attempt in 0..<c.config.poll_limit
+    val timed_attempts = c.config.initialize_us / 1000 + 1
+    val attempts = if c.config.poll_limit < timed_attempts then c.config.poll_limit else timed_attempts
+    for attempt in 0..<attempts
         r1(c,0,0) match
             Ok(1) ->
                 idle = true
@@ -211,7 +214,7 @@ private initialize_card[B: Spi](c: *Card[B]) -> Result[Info,Error]
         if echo.1 & 0xfff != 0x1aa then return Err(Error.Voltage)
     elif echo.0 != 5 then return Err(Error.Response(echo.0))
     var ready = false
-    for attempt in 0..<c.config.poll_limit
+    for attempt in 0..<attempts
         val prefix = r1(c,55,0)?
         if prefix != 1 && prefix != 0 then return Err(Error.Response(prefix))
         val response = r1(c,41,if version2 then 0x40000000 else 0)?

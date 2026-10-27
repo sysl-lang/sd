@@ -32,7 +32,10 @@ var volume = mount(&sd,sector[..])?
 ```
 
 Enable the optional `fat` feature to implement `fat.BlockDevice` for the card.
-The core has no filesystem dependency. The adapter preserves range/buffer errors
+The core has no filesystem dependency.
+The adapter exposes the whole card; it does not parse partition tables. Mount an
+unpartitioned FAT volume, or supply a partition-offset block-device view for a
+partitioned card. The adapter preserves range/buffer errors
 and maps other driver failures to `DeviceError.Io`; direct sector APIs retain
 full errors. Mount only after initialization. The application must serialize a
 card and lock a shared SPI bus for complete operations, including setup/cleanup.
@@ -51,3 +54,15 @@ after removal or bus recovery. These guarantees do not make FAT operations atomi
 Protocol references: [SD Association simplified specifications](https://www.sdcard.org/downloads/pls/),
 [Physical Layer v6, sections 5 and 7 (public mirror)](https://academy.cba.mit.edu/classes/networking_communications/SD/SD.pdf),
 [Analog Devices AN-1443](https://www.analog.com/en/resources/app-notes/an-1443.html).
+
+## Validation
+
+Run `./scripts/gate.sh`: core-only tests, tests with the optional FAT integration,
+and instantiated archives both with and without FAT for Cortex-M0+, Cortex-M4,
+Cortex-M33, RV32 and AArch64 freestanding targets. The build probes use unresolved
+board callbacks so they exercise all driver paths without an OS or heap; they
+are compile/link-input checks, not execution on those processors.
+
+Protocol tests use an independent test peer, command golden vectors and a
+separate CRC implementation. Benchtop card emulation and physical-card validation
+are later steps. Development uses `dev`; no release tag is published yet.

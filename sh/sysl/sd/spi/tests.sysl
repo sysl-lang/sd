@@ -74,6 +74,7 @@ struct Fake
     resets: u32
     command_error: u8
     command_status: u8
+    writes: u32
 
 private fake(legacy: bool = false, block: bool = true, sectors: u32 = 2048) -> Fake
     var c: [16]u8 = [0;16]
@@ -92,7 +93,7 @@ private fake(legacy: bool = false, block: bool = true, sectors: u32 = 2048) -> F
         c[8] = u8((size & 3) << 6)
     c[15] = ref_command(c[..<15])
     Fake(buf_filled(usize(sectors) * 512,0),legacy,block,c,false,0,0,1,0,0,[0;6],0,[0;520],0,0,false,true,2,false,false,0x1aa,
-        if block then 0xc0ff8000 else 0x80ff8000,false,false,0xfe,false,5,0,0,false,false,0,0,[0;514],0,0xffffffffffffffff,1,0,0,0,false,0,255,0)
+        if block then 0xc0ff8000 else 0x80ff8000,false,false,0xfe,false,5,0,0,false,false,0,0,[0;514],0,0xffffffffffffffff,1,0,0,0,false,0,255,0,0)
 
 private push(c: *Fake, byte: u8)
     assert(c.reply_count < c.reply.len)
@@ -156,6 +157,10 @@ private dispatch(c: *Fake)
         response(c,0)
         packet(c,c.csd[..])
     elif index == 17 || index == 24
+        if index == 17 then c.last_read = arg
+        else
+            c.last_write = arg
+            c.writes += 1
         sector(c,arg) match
             None -> response(c,0x20)
             Some(at) ->
@@ -344,7 +349,7 @@ write_errors()
         elif mode == 1 then assert(result == Err(Error.WriteRejected(0x0d)))
         elif mode == 2 then assert(result == Err(Error.Timeout(Phase.Program)))
         else assert(result == Err(Error.Status(0x20)))
-        assert(!c.bus.active && c.bus.last_write == 1)
+        assert(!c.bus.active && c.bus.last_write == 1 && c.bus.writes == 1)
 
 @test("SPI timeouts: absent/idle card, delayed responses, frozen clock and wrapping timer are bounded")
 timeouts()
@@ -411,3 +416,19 @@ fat_roundtrip()
     assert(c.read(0,out[..<511]) == Err(DeviceError.BadLength))
     assert(!c.bus.active)
 #endif
+
+@test("SPI address boundaries: 64-bit sector counts retain full 32-bit block/byte arguments")
+address_boundaries()
+    var out: [512]u8
+    var hc = opened()
+    hc.info.sectors = 4294967296
+    // The small test peer rejects these sectors, but records the actual wire
+    // argument, independently proving that the driver did not truncate early.
+    assert(hc.read_sector(4294967295,out[..]) == Err(Error.Response(0x20)))
+    assert(hc.bus.last_read == 0xffffffff)
+    val before = hc.bus.exchanges
+    assert(hc.read_sector(4294967296,out[..]) == Err(Error.OutOfRange) && hc.bus.exchanges == before)
+    var sc = opened(false,false)
+    sc.info.sectors = 4194304
+    assert(sc.read_sector(4194303,out[..]) == Err(Error.Response(0x20)))
+    assert(sc.bus.last_read == 0x7ffffe00)
