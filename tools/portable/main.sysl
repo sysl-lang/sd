@@ -46,3 +46,39 @@ probe() -> int
     if v.flush().is_err() then return 7
 #endif
     0
+
+import sh.sysl.sd.native as native
+import sh.sysl.sd.Error
+extern "sd_native_configure" native_configure(hz: u32, width: u32) -> bool
+extern "sd_native_command" native_command(index: u32, arg: u32, response: u32, words: *u32) -> bool
+extern "sd_native_read" native_read(index: u32, arg: u32, bytes: *u8, count: usize) -> bool
+extern "sd_native_write" native_write(index: u32, arg: u32, bytes: *u8, count: usize) -> bool
+struct NativeTransport
+end NativeTransport
+impl native.Host for NativeTransport
+    configure(*self, hz: u32, width: u32) -> Result[unit,Error] = if native_configure(hz,width) then Ok(()) else Err(Error.Crc)
+    command(*self, index: u32, arg: u32, response: native.Response) -> Result[[4]u32,Error]
+        var words: [4]u32
+        val kind: u32 = response match
+            native.Response.None -> 0
+            native.Response.Short -> 1
+            native.Response.Long -> 3
+            native.Response.NoCrc -> 2
+        if native_command(index,arg,kind,&words[0]) then Ok(words) else Err(Error.Crc)
+    read_data(*self, index: u32, arg: u32, out: []u8) -> Result[unit,Error] = if native_read(index,arg,&out[0],out.len) then Ok(()) else Err(Error.Crc)
+    write_data(*self, index: u32, arg: u32, bytes: []const u8) -> Result[unit,Error] = if native_write(index,arg,&bytes[0],bytes.len) then Ok(()) else Err(Error.Crc)
+impl Clock for NativeTransport
+    now_us(self) -> u64 = port_now()
+    delay_us(*self, micros: u32) = port_delay(micros)
+@export("sd_native_portability_probe")
+native_probe() -> int
+    var c = native.card(NativeTransport())
+    if c.initialize().is_err() then return 1
+    var bytes: [512]u8
+    if c.read_sector(0,bytes[..]).is_err() || c.write_sector(0,bytes[..]).is_err() || c.sync().is_err() then return 2
+#if feature_fat
+    var volume = mount(&c,bytes[..]).unwrap()
+    var file = volume.create("NATIVE.TXT").unwrap()
+    if volume.write(&file,bytes[..]).is_err() || volume.flush().is_err() then return 3
+#endif
+    0

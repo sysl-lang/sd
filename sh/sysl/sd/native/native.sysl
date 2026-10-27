@@ -73,7 +73,9 @@ struct Card[H: Host + Clock]
         self.host.configure(c.transfer_hz,width)?
         self.info = info
         self.ready = true
-        self.sync()?
+        val settled = self.sync()
+        if settled.is_err() then self.ready = false
+        settled?
         Ok(info)
     read_sector(*self, sector: u64, out: []u8) -> Result[unit,Error]
         val address = address(self,sector,out.len)?

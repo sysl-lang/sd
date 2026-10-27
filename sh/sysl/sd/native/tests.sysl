@@ -1,0 +1,148 @@
+module sh.sysl.sd.native
+@tests
+import sh.sysl.sd.{Clock,Error,Phase,CardKind,settings}
+
+private struct Fake
+    now: u64
+    clock: u32
+    width: u32
+    calls: u32
+    attempts: u32
+    busy: u32
+    frozen: bool
+    not_ready: bool
+    bad_echo: bool
+    bad_scr: bool
+    one_bit: bool
+    protected: bool
+    fail: bool
+    address: u32
+    data: [512]u8
+private fake() -> Fake = Fake(0,0,1,0,0,0,false,false,false,false,false,false,false,0,[0;512])
+impl Clock for Fake
+    now_us(self) -> u64 = self.now
+    delay_us(*self, micros: u32) = if !self.frozen then self.now += u64(micros)
+impl Host for Fake
+    configure(*self, hz: u32, width: u32) -> Result[unit,Error]
+        assert(hz <= 25000000 && (width == 1 || width == 4))
+        self.clock = hz
+        self.width = width
+        Ok(())
+    command(*self, index: u32, arg: u32, response: Response) -> Result[[4]u32,Error]
+        self.calls += 1
+        if self.fail then return Err(Error.Crc)
+        var out: [4]u32 = [0;4]
+        index match
+            0 -> assert(response == Response.None && self.width == 1)
+            8 -> out[0] = if self.bad_echo then 0x1ab else 0x1aa
+            55 -> assert(arg == 0 || arg == 0x12340000)
+            41 ->
+                assert(response == Response.NoCrc && arg & 0x40000000 != 0)
+                self.attempts += 1
+                out[0] = if self.not_ready || self.attempts < 3 then 0x00ff8000 else 0xc0ff8000
+            2 -> assert(response == Response.Long)
+            3 -> out[0] = 0x12340700
+            9 ->
+                assert(response == Response.Long && arg == 0x12340000)
+                out = [0x400e0032,0x5b590000,0x001f0000,if self.protected then 0x02402001u32 else 0x02400001u32]
+            7 -> assert(arg == 0x12340000)
+            6 -> assert(arg == 2)
+            13 ->
+                assert(arg == 0x12340000)
+                out[0] = if self.busy > 0 then 0xe00 else 0x900
+                if self.busy > 0 then self.busy -= 1
+            _ -> assert(false,s"unexpected native command $index")
+        Ok(out)
+    read_data(*self, index: u32, arg: u32, out: []u8) -> Result[unit,Error]
+        if self.fail then return Err(Error.Crc)
+        if index == 51
+            assert(out.len == 8)
+            for i in 0..<8 do out[i] = 0
+            out[0] = if self.bad_scr then 0xf2 else 2
+            out[1] = if self.one_bit then 1 else 5
+        else
+            assert(index == 17 && out.len == 512)
+            self.address = arg
+            for i in 0..<512 do out[i] = self.data[i]
+        Ok(())
+    write_data(*self, index: u32, arg: u32, bytes: []const u8) -> Result[unit,Error]
+        assert(index == 24 && bytes.len == 512)
+        if self.fail then return Err(Error.Crc)
+        self.address = arg
+        for i in 0..<512 do self.data[i] = bytes[i]
+        self.busy = 2
+        Ok(())
+
+@test("native SD: initialization assigns RCA, parses CSD/SCR and negotiates four-bit transfer speed")
+initialize_native()
+    var c = card(fake())
+    val info = c.initialize().unwrap()
+    assert(info.kind == CardKind.Sdhc && info.sectors == 32768 && !info.write_protected)
+    assert(c.host.width == 4 && c.host.clock == 8000000 && c.host.attempts == 3)
+    assert(c.information() == Some(info))
+    var b = fake()
+    b.one_bit = true
+    c = card(b)
+    c.initialize().unwrap()
+    assert(c.host.width == 1)
+
+@test("native SD: bounded sector transfers, readiness polling, addressing and write protection")
+sectors_native()
+    var c = card(fake())
+    var bytes: [512]u8 = [0;512]
+    assert(c.read_sector(0,bytes[..]).err() == Some(Error.NotInitialized))
+    c.initialize().unwrap()
+    for i in 0..<512 do bytes[i] = u8(i * 7)
+    c.write_sector(32767,bytes[..]).unwrap()
+    assert(c.host.address == 32767 && c.host.busy == 0)
+    var out: [512]u8
+    c.read_sector(32767,out[..]).unwrap()
+    for i in 0..<512 do assert(out[i] == bytes[i])
+    assert(c.read_sector(32768,out[..]).err() == Some(Error.OutOfRange))
+    assert(c.read_sector(0,out[..<511]).err() == Some(Error.BadLength))
+    var protected = fake()
+    protected.protected = true
+    c = card(protected)
+    assert(c.initialize().unwrap().write_protected)
+    assert(c.write_sector(0,bytes[..]).err() == Some(Error.WriteProtected))
+
+@test("native SD: invalid settings, echo, SCR, command errors and frozen-clock initialization remain bounded")
+failures_native()
+    var config = settings()
+    config.initial_hz = 0
+    var c = card(fake(),config)
+    assert(c.initialize().err() == Some(Error.InvalidSettings) && c.host.calls == 0)
+    var b = fake()
+    b.bad_echo = true
+    c = card(b)
+    assert(c.initialize().err() == Some(Error.Echo) && c.information().is_none())
+    b = fake()
+    b.bad_scr = true
+    c = card(b)
+    assert(c.initialize().err() == Some(Error.InvalidScr) && c.information().is_none())
+    b = fake()
+    b.frozen = true
+    b.not_ready = true
+    config = settings()
+    config.initialize_us = 2000
+    c = card(b,config)
+    assert(c.initialize().err() == Some(Error.Timeout(Phase.Initialize)) && c.host.attempts < 10)
+    b = fake()
+    b.fail = true
+    c = card(b)
+    assert(c.initialize().err() == Some(Error.Crc) && c.information().is_none())
+    assert(check_status(1 << 26).err() == Some(Error.CardStatus(1 << 26)))
+
+@test("native SD: data errors propagate and programming timeouts never retry accepted writes")
+program_native()
+    var c = card(fake())
+    c.initialize().unwrap()
+    c.host.fail = true
+    var bytes: [512]u8
+    assert(c.read_sector(0,bytes[..]).err() == Some(Error.Crc))
+    assert(c.write_sector(0,bytes[..]).err() == Some(Error.Crc))
+    c.host.fail = false
+    c.host.busy = 100
+    c.host.frozen = true
+    c.config.program_us = 2000
+    assert(c.sync().err() == Some(Error.Timeout(Phase.Program)))
