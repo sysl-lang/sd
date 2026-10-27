@@ -32,6 +32,8 @@ enum Error derives Eq, Display
     Echo
     UnsupportedCsd(structure: u8)
     InvalidCsd
+    InvalidScr
+    CardStatus(status: u32)
     Crc
     ReadToken(token: u8)
     WriteRejected(token: u8)

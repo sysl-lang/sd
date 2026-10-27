@@ -1,0 +1,27 @@
+module sh.sysl.sd.native
+@no_alloc
+#if feature_fat
+import sh.sysl.sd.{Clock,Error,SECTOR_SIZE}
+import sh.sysl.fat.{BlockDevice,DeviceError}
+private device_error(error: Error) -> DeviceError = error match
+    Error.BadLength -> DeviceError.BadLength
+    Error.OutOfRange -> DeviceError.OutOfRange
+    _ -> DeviceError.Io
+impl[H: Host + Clock] BlockDevice for Card[H]
+    sector_size(self) -> usize = SECTOR_SIZE
+    sectors(self) -> u64 = self.information() match
+        Some(info) -> info.sectors
+        None -> 0
+    read(*self, sector: u64, out: []u8) -> Result[unit,DeviceError]
+        self.read_sector(sector,out) match
+            Ok(_) -> Ok(())
+            Err(error) -> Err(device_error(error))
+    write(*self, sector: u64, bytes: []const u8) -> Result[unit,DeviceError]
+        self.write_sector(sector,bytes) match
+            Ok(_) -> Ok(())
+            Err(error) -> Err(device_error(error))
+    flush(*self) -> Result[unit,DeviceError]
+        self.sync() match
+            Ok(_) -> Ok(())
+            Err(error) -> Err(device_error(error))
+#endif
