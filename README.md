@@ -79,7 +79,7 @@ cards, MCU transports and Benchtop integration have not yet been validated.
 ## Native SD hosts
 
 `sh.sysl.sd.native` supports native SD v2 memory-card initialization and
-single-sector reads/writes, alongside the existing SPI driver. Implement its
+single-sector and multiblock reads/writes, alongside the existing SPI driver. Implement its
 allocation-free `Host` trait and `sh.sysl.sd.Clock` for a controller adapter:
 configure the bus, send commands with none/short/long/no-CRC responses, and
 transfer command-associated data with bounded timeouts. Data callbacks check
@@ -95,7 +95,7 @@ contract are shared. Host hardware supplies command/data CRC checking; the SPI
 accepted writes are never automatically retried.
 
 The initial native path targets SD v2 memory cards; legacy cards without CMD8,
-MMC/eMMC, SDIO functions, high-speed switching and multiblock commands are not
+MMC/eMMC, SDIO functions and high-speed switching are not
 implemented. The host adapter owns DMA/cache policy and platform arbitration;
 this package has no register addresses, filesystem or OS dependency. The
 portability probes instantiate native and SPI transfers, with and without FAT,
@@ -108,3 +108,7 @@ CMD18/25 followed by CMD12, including cleanup after data errors. The optional
 FAT adapter overrides bulk block I/O to use these transfers. Failed writes may
 have committed a prefix and are never automatically retried. SPI keeps its
 existing single-sector implementation through FAT's default bulk methods.
+
+Multiblock validation with Sysl 0.7.2: 20 core-only tests, 21 tests with FAT,
+and all ten freestanding archives passed. Benchtop exercises the native host
+through the real firmware; physical cards remain unvalidated.
