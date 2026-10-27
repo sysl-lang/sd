@@ -13,14 +13,21 @@ private ref_crc(data: []const u8) -> u16
         for bit in 0..<8 do crc = if crc & 0x8000 != 0 then (crc << 1) ^ 0x1021 else crc << 1
     crc
 private ref_command(data: []const u8) -> u8
-    var crc: u8 = 0
+    // Long division of the payload followed by seven zero bits by x^7+x^3+1.
+    var remainder: u16 = 0
     for byte in data
-        var x = byte
-        for bit in 0..<8
-            crc <<= 1
-            if (crc ^ x) & 0x80 != 0 then crc ^= 0x12
-            x <<= 1
-    crc | 1
+        for bit in 0u32..<8
+            remainder = (remainder << 1) | u16((byte >> (7 - bit)) & 1)
+            if remainder & 0x80 != 0 then remainder ^= 0x89
+    for bit in 0..<7
+        remainder <<= 1
+        if remainder & 0x80 != 0 then remainder ^= 0x89
+    u8((remainder << 1) | 1)
+
+@test("protocol peer CRC: independent polynomial division agrees with SD golden command bytes")
+reference_crc()
+    assert(ref_command([0x40u8,0,0,0,0]) == 0x95)
+    assert(ref_command([0x48u8,0,0,1,0xaa]) == 0x87)
 
 struct Fake
     storage: Buf[u8]
