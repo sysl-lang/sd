@@ -168,6 +168,22 @@ host_failure_native()
     assert(check_status(1 << 26).err() == Some(Error.CardStatus(1 << 26)))
     assert(check_status(0x900).is_ok())
 
+#if feature_fat
+import sh.sysl.fat.{BlockDevice,DeviceError}
+
+@test("native SD FAT adapter: a host failure reaches the caller as Io carrying sd's own code, unchanged")
+fat_io_code_native()
+    var c = card(fake(),ticker())
+    c.initialize().unwrap()
+    var out: [512]u8
+    assert(c.read(0,out[..]).is_ok())
+    c.host.fail = true
+    assert(c.read(0,out[..]) == Err(DeviceError.Io(2)))
+    assert(c.write(0,out[..]) == Err(DeviceError.Io(2)))
+    assert(c.read(32768,out[..]) == Err(DeviceError.OutOfRange))
+    assert(c.read(0,out[..<511]) == Err(DeviceError.BadLength))
+#endif
+
 @test("native SD: a failed reinitialization forgets the previous card")
 reinitialize_native()
     var c = card(fake(),ticker())

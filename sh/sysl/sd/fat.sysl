@@ -4,12 +4,36 @@ module sh.sysl.sd
 
 import sh.sysl.fat.DeviceError
 
+// The code a driver failure carries through fat as DeviceError.Io(code). One
+// stable number per Error variant; a variant's payload is not encoded. 0 is
+// fat's "no code" and is never produced here. New variants are appended.
+private[sd] io_code(error: Error) -> u32 = error match
+    Error.Bus(_) -> 1
+    Error.Host(_) -> 2
+    Error.NotInitialized -> 3
+    Error.InvalidSettings -> 4
+    Error.BadLength -> 5
+    Error.OutOfRange -> 6
+    Error.WriteProtected -> 7
+    Error.Timeout(_) -> 8
+    Error.R1(_) -> 9
+    Error.R2(_) -> 10
+    Error.CardStatus(_) -> 11
+    Error.Voltage -> 12
+    Error.Echo -> 13
+    Error.UnsupportedCsd(_) -> 14
+    Error.InvalidCsd -> 15
+    Error.InvalidScr -> 16
+    Error.Crc -> 17
+    Error.ReadToken(_) -> 18
+    Error.WriteRejected(_) -> 19
+
 // What both backends' fat.BlockDevice adapters report: range and buffer
-// errors keep their meaning, and every other driver failure is DeviceError.Io.
-// The card's own methods keep the full Error.
+// errors keep their meaning, and every other driver failure is
+// DeviceError.Io(io_code(error)). The card's own methods keep the full Error.
 private[sd] device_result(result: Result[unit,Error]) -> Result[unit,DeviceError] = result match
     Ok(_) -> Ok(())
     Err(Error.BadLength) -> Err(DeviceError.BadLength)
     Err(Error.OutOfRange) -> Err(DeviceError.OutOfRange)
-    Err(_) -> Err(DeviceError.Io)
+    Err(error) -> Err(DeviceError.Io(io_code(error)))
 #endif

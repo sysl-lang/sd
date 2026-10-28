@@ -141,11 +141,22 @@ error_conversions()
     assert(host_failure() == Err(Error.Host(HostError.DataCrc)))
 
 #if feature_fat
-@test("FAT adapter errors: range and length keep their meaning, every other failure is Io")
+@test("FAT adapter errors: range and length keep their meaning, every other failure is Io with its code")
 fat_device_result()
     assert(device_result(Ok(())).is_ok())
     assert(device_result(Err(Error.BadLength)) == Err(sh.sysl.fat.DeviceError.BadLength))
     assert(device_result(Err(Error.OutOfRange)) == Err(sh.sysl.fat.DeviceError.OutOfRange))
-    assert(device_result(Err(Error.Host(HostError.Io))) == Err(sh.sysl.fat.DeviceError.Io))
-    assert(device_result(Err(Error.R1(4))) == Err(sh.sysl.fat.DeviceError.Io))
+    assert(device_result(Err(Error.Host(HostError.Io))) == Err(sh.sysl.fat.DeviceError.Io(2)))
+    assert(device_result(Err(Error.R1(4))) == Err(sh.sysl.fat.DeviceError.Io(9)))
+
+@test("FAT adapter codes: one fixed non-zero code per Error variant, payload ignored")
+fat_io_codes()
+    val errors = [Error.Bus(BusError.Timeout),Error.Host(HostError.Io),Error.NotInitialized,Error.InvalidSettings,
+        Error.BadLength,Error.OutOfRange,Error.WriteProtected,Error.Timeout(Phase.Program),Error.R1(1),Error.R2(1),
+        Error.CardStatus(1),Error.Voltage,Error.Echo,Error.UnsupportedCsd(2),Error.InvalidCsd,Error.InvalidScr,
+        Error.Crc,Error.ReadToken(1),Error.WriteRejected(1)]
+    for i in 0..<errors.len
+        assert(io_code(errors[i]) == u32(i + 1))
+    assert(io_code(Error.R1(1)) == io_code(Error.R1(0x20)))
+    assert(io_code(Error.Timeout(Phase.Initialize)) == io_code(Error.Timeout(Phase.Program)))
 #endif

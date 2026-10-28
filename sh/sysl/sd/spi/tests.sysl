@@ -542,6 +542,19 @@ fat_roundtrip()
     assert(c.read(32768,out[..]) == Err(DeviceError.OutOfRange))
     assert(c.read(0,out[..<511]) == Err(DeviceError.BadLength))
     assert(!c.bus.active)
+
+@test("FAT adapter: a failing SPI card reaches the caller as Io carrying sd's own code, unchanged")
+fat_io_code()
+    var time = Time(0,1)
+    var c = opened(&time)
+    var out: [512]u8
+    c.bus.command_error = 17
+    c.bus.command_status = 0x20
+    assert(c.read(0,out[..]) == Err(DeviceError.Io(9)))
+    c.bus.command_error = 0
+    c.bus.bad_crc = true
+    assert(c.read(0,out[..]) == Err(DeviceError.Io(17)))
+    assert(!c.bus.active)
 #endif
 
 @test("SPI address boundaries: 64-bit sector counts retain full 32-bit block/byte arguments")

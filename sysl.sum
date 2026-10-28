@@ -1,6 +1,2 @@
-github.com/sysl-lang/fat v0.1.1 sha256:d2035ded920b8d8d7990c5e3ad095b0d9a61731188948b51f4b2df2b108a0ea8
-github.com/sysl-lang/fat v0.2.0 sha256:de0f7fabd0fe47ba6c1b9e94f4439bedd9193327b6cb5c6bf76903e23fdcbd0b
-github.com/sysl-lang/fat 46da2454b2baadffda17a450d2066149819b22e7 sha256:7103dc4ca1ae30cc2c4c976d313d7a8542080b3fa054a4eedad6647f0396bcf8
-github.com/sysl-lang/spi v0.1.0 sha256:a2395f27cee663aa85b74679a92c17833a3d89baacc8ea95268f70dec1e5badd
+github.com/sysl-lang/fat v0.3.0 sha256:4eab105129f8a7dd0d4467bfb758203a16851bcdbc28e55d411cce511ba895d4
 github.com/sysl-lang/spi v0.2.0 sha256:7b647499b268ad8a377219c3e7e377544f3e47c394e5f5e4041a730d673d429c
-github.com/sysl-lang/spi 7852bfa1f2e7a23e3cbbe650ba179632ab9caa2d sha256:fc0a25502cbeabfe2e670ae9fb2dffb09e844cb41a691607e1168ee106a9d0e4

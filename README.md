@@ -11,7 +11,7 @@ high-speed switching are not implemented. Physical cards have not been validated
 
 ```hocon
 dependencies {
-  sd { git = "github.com/sysl-lang/sd", version = "0.2.0", features = [fat] }
+  sd { git = "github.com/sysl-lang/sd", version = "0.2.1", features = [fat] }
 }
 ```
 
@@ -59,8 +59,13 @@ its transport carries: `R1` and `R2` for SPI mode, `CardStatus` for native hosts
 The optional `fat` feature implements `fat.BlockDevice` for both cards. The
 adapter exposes the whole card and does not parse partition tables: mount an
 unpartitioned FAT volume, or supply a partition-offset view. It keeps range and
-buffer errors and maps every other failure to `DeviceError.Io`; the card's own
-methods keep the full error. Mount only after initialization. The application
+buffer errors and maps every other failure to `DeviceError.Io(code)`, where
+`code` is a fixed number per `Error` variant (a variant's payload is not
+encoded; 0 is never used): `Bus` 1, `Host` 2, `NotInitialized` 3,
+`InvalidSettings` 4, `BadLength` 5, `OutOfRange` 6, `WriteProtected` 7,
+`Timeout` 8, `R1` 9, `R2` 10, `CardStatus` 11, `Voltage` 12, `Echo` 13,
+`UnsupportedCsd` 14, `InvalidCsd` 15, `InvalidScr` 16, `Crc` 17, `ReadToken` 18,
+`WriteRejected` 19. The card's own methods keep the full error. Mount only after initialization. The application
 serializes a card and its shared bus for complete operations. These guarantees
 do not make FAT operations atomic.
 
