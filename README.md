@@ -75,9 +75,11 @@ do not make FAT operations atomic.
 through a controller adapter implementing the allocation-free `Host` trait:
 configure the clock and `BusWidth`, send a command expecting a `Response`
 (`Empty`, `R1`, `R2`, `R3`), and transfer command-associated data with a
-bounded timeout. R2 words are most significant first. Data callbacks check both
-R1 and controller transfer errors and report a controller failure as
-`Error.Host`. Initialization sends CMD0/8, ACMD41, CMD2/3/9/7, reads the SCR and
+bounded timeout. R2 words are most significant first. Data callbacks report
+controller transfer errors as `Error.Host`; they need not check R1, because the
+card reads the card status after every transfer and reports an error bit as
+`Error.CardStatus`. `native.card_status_error(status)` classifies a status word
+(`CARD_STATUS_ERRORS` is the error mask) for a host that wants to. Initialization sends CMD0/8, ACMD41, CMD2/3/9/7, reads the SCR and
 negotiates a four-bit bus when the card has one. Host hardware checks command and
 data CRCs; the `check_crc` setting is SPI's. The adapter owns DMA/cache policy
 and arbitration.

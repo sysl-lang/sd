@@ -18,9 +18,11 @@ enum BusWidth
 
 // Controller-specific adapters implement bounded commands and data transfers.
 // R2 replies are bits 127..0, MSW first, as in STM32 SDMMC RESP1..RESP4.
-// Data callbacks issue their command and check R1 plus controller data errors.
-// A controller failure is reported as Error.Host; a card error the data path
-// reads from R1 as Error.CardStatus.
+// Data callbacks issue their command and report controller data errors. They
+// need not look at R1: the card reports a command's error bits in its next
+// status response, and the card checks that status after every transfer. A
+// controller failure is reported as Error.Host; a card error as
+// Error.CardStatus.
 trait Host
     max_blocks(self) -> usize = 65535
     configure(*self, hz: u32, width: BusWidth) -> Result[unit,Error]
@@ -28,9 +30,11 @@ trait Host
     read_data(*self, index: u8, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error]
     write_data(*self, index: u8, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[unit,Error]
 
-// Card status (section 4.10.1). Every error bit, then the CURRENT_STATE field
-// and READY_FOR_DATA, which together say the card can take the next transfer.
-private const STATUS_ERRORS: u32 = 0xfdffe008
+// Card status (section 4.10.1). CARD_STATUS_ERRORS is every error bit (address,
+// block length, erase, write protect, lock, CRC, illegal command, ECC, card
+// controller, general error, overwrite and sequence errors); the CURRENT_STATE
+// field and READY_FOR_DATA together say the card can take the next transfer.
+const CARD_STATUS_ERRORS: u32 = 0xfdffe008
 private const CURRENT_STATE: u32 = 0x1e00
 private const STATE_TRAN: u32 = 0x800
 private const READY_FOR_DATA: u32 = 0x100
@@ -41,8 +45,15 @@ private const RCA: u32 = 0xffff0000
 // ACMD6's argument for a four-bit bus.
 private const FOUR_BIT_BUS: u32 = 2
 
+// The error a card status word reports, or None when no error bit is set. The
+// card applies this to every status it reads; a host only needs it to classify
+// a status word of its own.
+card_status_error(status: u32) -> Option[Error] = if status & CARD_STATUS_ERRORS != 0 then Some(Error.CardStatus(status)) else None
+
 private[native] check_status(status: u32) -> Result[unit,Error]
-    if status & STATUS_ERRORS != 0 then Err(Error.CardStatus(status)) else Ok(())
+    card_status_error(status) match
+        Some(e) -> Err(e)
+        None -> Ok(())
 
 struct Card[H: Host, K: Clock]
     private[native] host: H
@@ -108,7 +119,8 @@ impl[H: Host, K: Clock] Media for Card[H,K]
 
     read_sector(*self, sector: u64, out: []u8) -> Result[unit,Error]
         val address = argument(self.information(),sector,out.len)?
-        self.host.read_data(READ_SINGLE_BLOCK,address,out,self.config.read_us)
+        self.host.read_data(READ_SINGLE_BLOCK,address,out,self.config.read_us)?
+        read_status(self)
 
     write_sector(*self, sector: u64, bytes: []const u8) -> Result[unit,Error]
         val address = argument(self.information(),sector,bytes.len)?
@@ -129,7 +141,9 @@ impl[H: Host, K: Clock] Media for Card[H,K]
             val count = if left > maximum then maximum else left
             val arg = argument(self.information(),sector + u64(done),SECTOR_SIZE)?
             val into = out[done * SECTOR_SIZE..<(done + count) * SECTOR_SIZE]
-            if count == 1 then self.host.read_data(READ_SINGLE_BLOCK,arg,into,self.config.read_us)?
+            if count == 1
+                self.host.read_data(READ_SINGLE_BLOCK,arg,into,self.config.read_us)?
+                read_status(self)?
             else
                 finish(self.host.read_data(READ_MULTIPLE_BLOCK,arg,into,self.config.read_us),stop(self))?
                 self.sync()?
@@ -162,6 +176,11 @@ card[H: Host, K: Clock](host: H, clock: K, config: Settings = settings()) -> Car
 // Ends a multiblock run; sent whatever the transfer returned.
 private stop[H: Host, K: Clock](c: *Card[H,K]) -> Result[unit,Error]
     check_status(c.host.command(STOP_TRANSMISSION,0,Response.R1)?[0])
+
+// Reads the card status after a single-block read, where the card reports the
+// transfer's error bits. Writes and multiblock runs are checked by `sync`.
+private read_status[H: Host, K: Clock](c: *Card[H,K]) -> Result[unit,Error]
+    check_status(c.host.command(SEND_STATUS,c.rca,Response.R1)?[0])
 
 // Polls SEND_STATUS until the card is in the transfer state and ready for
 // data, bounded by the programming deadline and the poll limit.

@@ -30,10 +30,11 @@ private struct Fake
     multi_writes: u32
     fail_data: bool
     fail_stop: bool
+    bad_status: u32
     data: [4096]u8
 private fake() -> Fake = Fake(clock = 0, width = BusWidth.One, calls = 0, attempts = 0, busy = 0, not_ready = false, bad_echo = false, bad_scr = false,
     one_bit = false, protected = false, fail = false, address = 0, maximum = 65535, stops = 0, multi_reads = 0, multi_writes = 0,
-    fail_data = false, fail_stop = false, data = [0;4096])
+    fail_data = false, fail_stop = false, bad_status = 0, data = [0;4096])
 impl Host for Fake
     override max_blocks(self) -> usize = self.maximum
     configure(*self, hz: u32, width: BusWidth) -> Result[unit,Error]
@@ -72,6 +73,7 @@ impl Host for Fake
                 assert(response == Response.R1 && arg == 0x12340000)
                 out[0] = if self.busy > 0 then 0xe00 else 0x900
                 if self.busy > 0 then self.busy -= 1
+                out[0] |= self.bad_status
             _ -> assert(false,s"unexpected native command $index")
         Ok(out)
     read_data(*self, index: u8, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error]
@@ -167,6 +169,36 @@ host_failure_native()
     assert(c.initialize().err() == Some(Error.Host(HostError.Timeout)) && c.information().is_none())
     assert(check_status(1 << 26).err() == Some(Error.CardStatus(1 << 26)))
     assert(check_status(0x900).is_ok())
+
+@test("native SD: card_status_error classifies error bits and ignores state bits")
+card_status_error_native()
+    assert(card_status_error(0x900) == None)
+    assert(card_status_error(1 << 25) == None)
+    assert(card_status_error(CARD_STATUS_ERRORS) == Some(Error.CardStatus(CARD_STATUS_ERRORS)))
+    for bit in [31u32,30,29,28,27,26,24,23,22,21,20,19,18,17,16,15,14,13,3]
+        assert(card_status_error(0x900 | (1 << bit)) == Some(Error.CardStatus(0x900 | (1 << bit))))
+
+@test("native SD: error bits in the card status reach the caller without the host checking R1, on every data path")
+card_status_without_host_native()
+    val bits = 1u32 << 31
+    var bytes: [1024]u8 = [0;1024]
+    var out: [1024]u8
+    var c = card(fake(),ticker())
+    c.initialize().unwrap()
+    c.host.bad_status = bits
+    assert(c.read_sector(0,out[..<512]).err() == Some(Error.CardStatus(0x900 | bits)))
+    assert(c.read_sectors(0,out[..<512]).err() == Some(Error.CardStatus(0x900 | bits)))
+    assert(c.read_sectors(0,out[..]).err() == Some(Error.CardStatus(0x900 | bits)))
+    assert(c.write_sector(0,bytes[..<512]).err() == Some(Error.CardStatus(0xe00 | bits)))
+    c.host.busy = 0
+    assert(c.write_sectors(0,bytes[..<512]).err() == Some(Error.CardStatus(0xe00 | bits)))
+    c.host.busy = 0
+    assert(c.write_sectors(0,bytes[..]).err() == Some(Error.CardStatus(0xe00 | bits)))
+    assert(c.host.multi_reads == 1 && c.host.multi_writes == 1 && c.host.stops == 2)
+    c.host.bad_status = 0
+    c.host.busy = 0
+    c.read_sector(0,out[..<512]).unwrap()
+    c.write_sectors(0,bytes[..]).unwrap()
 
 #if feature_fat
 import sh.sysl.fat.{BlockDevice,DeviceError}
