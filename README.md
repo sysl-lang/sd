@@ -1,59 +1,86 @@
 # sd
 
-A standalone Sysl SD-card driver for embedded firmware. No Benchtop dependency,
-operating system, allocator or floating point. ISC licensed.
+A standalone Sysl SD-card driver for embedded firmware: no operating system,
+allocator or floating point. ISC licensed.
 
-The first backend is SPI mode: SDSC (v1/v2), SDHC and SDXC at 3.3 V, with
-512-byte sector reads/writes, CSD capacity discovery, command/data CRCs, bounded
-polling, busy handling and programming-status checks. A native SD v2 backend
-now supports SDMMC host adapters with shared metadata and FAT integration. SDIO
-functions, MMC/eMMC, SDUC and high-speed switching are not implemented yet.
-This initial implementation is not validated on physical cards.
+Two backends answer one `sh.sysl.sd.Media` trait: SPI mode (`sh.sysl.sd.spi`)
+and native SD hosts (`sh.sysl.sd.native`). Both handle SDSC (v1/v2), SDHC and
+SDXC with 512-byte sectors, CSD capacity discovery, bounded polling, busy
+handling and programming-status checks. SDIO functions, MMC/eMMC, SDUC and
+high-speed switching are not implemented. Physical cards have not been validated.
 
 ```hocon
 dependencies {
-  sd { git = "github.com/sysl-lang/sd", version = "0.1.1", features = [fat] }
+  sd { git = "github.com/sysl-lang/sd", version = "0.2.0", features = [fat] }
 }
 ```
 
-Implement `sh.sysl.spi.Device` for your MCU connection (or wrap `spi.Bus` and
-`spi.ChipSelect` with `spi.exclusive`), and implement `sh.sysl.sd.Clock` as a
-separate value for SD polling deadlines. `card(device, clock, settings)` takes
-both; the clock is a board-wide service, not part of the SPI link.
-The platform supplies a monotonic microsecond clock and bounded hardware waits.
-Default bulk read/write methods use byte exchanges; implementations may override
-them with DMA. The driver owns the transport, uses caller buffers and keeps CS
-asserted through complete command/data transactions.
+## Use
 
 ```sysl
+import sh.sysl.sd.settings
 import sh.sysl.sd.spi.card
 import sh.sysl.fat.mount
 
-var sd = card(my_spi_transport,my_clock)
-val info = sd.initialize()?
+var sd = card(my_spi_device,my_clock,settings(transfer_hz = 12000000))
+val info = sd.initialize().unwrap()
 var sector: [512]u8
-var volume = mount(&sd,sector[..])?
+var volume = mount(&sd,sector[..]).unwrap()
 ```
 
-Enable the optional `fat` feature to implement `fat.BlockDevice` for the card.
-The core depends on the standalone `spi` interfaces, with no filesystem dependency.
-The adapter exposes the whole card; it does not parse partition tables. Mount an
-unpartitioned FAT volume, or supply a partition-offset block-device view for a
-partitioned card. The adapter preserves range/buffer errors
-and maps other driver failures to `DeviceError.Io`; direct sector APIs retain
-full errors. Mount only after initialization. The application must serialize a
-card and lock a shared SPI bus for complete operations, including setup/cleanup.
+`card(device, clock, settings)` takes an `sh.sysl.spi.Device` and a separate
+`sh.sysl.sd.Clock`: the clock is a board-wide service, not part of the SPI link.
+`spi.device(bus, cs, config)` makes a `Device` from an MCU's `spi.Bus` and
+`spi.ChipSelect`. The platform supplies a monotonic microsecond clock and
+bounded hardware waits; SPI callbacks must return on hardware failure, since an
+outer deadline cannot interrupt a callback that never returns. Poll-count limits
+additionally bound a frozen clock.
 
-Default settings initialize at 400 kHz, transfer at 8 MHz and enable data CRC
-checking. Supply and pin-mux setup, card detection and physical write-protect
-switches belong to the board transport. CSD write protection is enforced. SPI
-callbacks must return on hardware failure: an outer deadline cannot interrupt a
-callback that never returns. Poll-count limits additionally bound a frozen clock.
+`settings()` takes every field by name, with defaults: initialization at
+400 kHz, transfer at 8 MHz, data CRC checking on. `Settings.validate()` is what
+`initialize` checks first.
 
-Writes wait for programming completion and check CMD13 status; `sync()` checks
-readiness/status again (the FAT adapter calls it from `flush`). A failed write may already have changed media and is
-never automatically retried. Read buffers must be discarded on error. Reinitialize
-after removal or bus recovery. These guarantees do not make FAT operations atomic.
+## Media
+
+`initialize`, `information`, `read_sector`, `write_sector`, `read_sectors`,
+`write_sectors` and `sync`. A multi-sector call takes a buffer of whole sectors.
+Writes wait for programming completion and check the card's status; `sync()`
+checks readiness and status again. A failed write may already have changed the
+media and is never automatically retried. Read buffers must be discarded on
+error. Reinitialize after removal or bus recovery; a failed initialization
+forgets the previous card.
+
+Errors are `sh.sysl.sd.Error`. A transport failure is `Bus` (SPI) or `Host`
+(a native controller's `HostError`); an error the card reports keeps the format
+its transport carries: `R1` and `R2` for SPI mode, `CardStatus` for native hosts.
+
+## FAT
+
+The optional `fat` feature implements `fat.BlockDevice` for both cards. The
+adapter exposes the whole card and does not parse partition tables: mount an
+unpartitioned FAT volume, or supply a partition-offset view. It keeps range and
+buffer errors and maps every other failure to `DeviceError.Io`; the card's own
+methods keep the full error. Mount only after initialization. The application
+serializes a card and its shared bus for complete operations. These guarantees
+do not make FAT operations atomic.
+
+## Native SD hosts
+
+`sh.sysl.sd.native.card(host, clock, settings)` drives an SD v2 memory card
+through a controller adapter implementing the allocation-free `Host` trait:
+configure the clock and `BusWidth`, send a command expecting a `Response`
+(`Empty`, `R1`, `R2`, `R3`), and transfer command-associated data with a
+bounded timeout. R2 words are most significant first. Data callbacks check both
+R1 and controller transfer errors and report a controller failure as
+`Error.Host`. Initialization sends CMD0/8, ACMD41, CMD2/3/9/7, reads the SCR and
+negotiates a four-bit bus when the card has one. Host hardware checks command and
+data CRCs; the `check_crc` setting is SPI's. The adapter owns DMA/cache policy
+and arbitration.
+
+`read_sectors` and `write_sectors` are bounded by `Host.max_blocks()`: single
+sectors use CMD17/24, longer runs CMD18/25 followed by CMD12, including after a
+data error. The FAT adapter uses them for bulk block I/O. On SPI the same calls
+send one single-block command per sector.
 
 Protocol references: [SD Association simplified specifications](https://www.sdcard.org/downloads/pls/),
 [Physical Layer v6, sections 5 and 7 (public mirror)](https://academy.cba.mit.edu/classes/networking_communications/SD/SD.pdf),
@@ -61,56 +88,10 @@ Protocol references: [SD Association simplified specifications](https://www.sdca
 
 ## Validation
 
-Run `./scripts/gate.sh`: core-only tests, tests with the optional FAT integration,
-and instantiated archives both with and without FAT for Cortex-M0+, Cortex-M4,
-Cortex-M33, RV32 and AArch64 freestanding targets. The build probes use unresolved
-board callbacks so they exercise all driver paths without an OS or heap; they
-are compile/link-input checks, not execution on those processors.
-
-Protocol tests use an independent test peer, command golden vectors and a
-separate CRC implementation. Benchtop card emulation and physical-card validation
-are later steps. Development uses `dev`; no release tag is published yet.
-
-Validation on October 27, 2026, using Sysl 0.7.0: 14 core-only tests and 15 tests
-with FAT enabled passed. All ten freestanding archives built successfully (the
-five targets above, each with and without FAT). This verifies protocol behavior
-against the independent peer and compilation of the instantiated APIs; physical
-cards, MCU transports and Benchtop integration have not yet been validated.
-
-## Native SD hosts
-
-`sh.sysl.sd.native` supports native SD v2 memory-card initialization and
-single-sector and multiblock reads/writes, alongside the existing SPI driver. Implement its
-allocation-free `Host` trait for a controller adapter and `sh.sysl.sd.Clock` for the
-timebase:
-configure the bus, send commands with none/short/long/no-CRC responses, and
-transfer command-associated data with bounded timeouts. Data callbacks check
-both R1 and controller transfer errors; sector and SCR transfers receive their
-configured timeout explicitly. Native response words are MSW first.
-
-`native.card(host, clock)` exposes the same initialize/information/read_sector/
-write_sector/sync API and optional `fat.BlockDevice` interface as SPI. It sends
-CMD0/8, CMD55/ACMD41, CMD2/3/9/7, reads SCR and negotiates four-bit mode when
-available. CSD parsing/capacity, settings, errors and the FAT block-device
-contract are shared. Host hardware supplies command/data CRC checking; the SPI
-`check_crc` setting does not disable native CRC. Writes wait for CMD13 readiness;
-accepted writes are never automatically retried.
-
-The initial native path targets SD v2 memory cards; legacy cards without CMD8,
-MMC/eMMC, SDIO functions and high-speed switching are not
-implemented. The host adapter owns DMA/cache policy and platform arbitration;
-this package has no register addresses, filesystem or OS dependency. The
-portability probes instantiate native and SPI transfers, with and without FAT,
-for all five supported freestanding probe targets.
-
-Native cards expose `read_sectors` and `write_sectors` for caller-owned buffers
-whose lengths are multiples of 512 bytes. Requests are bounded by
-`Host.max_blocks()`; single sectors retain CMD17/24, while larger chunks use
-CMD18/25 followed by CMD12, including cleanup after data errors. The optional
-FAT adapter overrides bulk block I/O to use these transfers. Failed writes may
-have committed a prefix and are never automatically retried. SPI keeps its
-existing single-sector implementation through FAT's default bulk methods.
-
-Multiblock validation with Sysl 0.7.2: 20 core-only tests, 21 tests with FAT,
-and all ten freestanding archives passed. Benchtop exercises the native host
-through the real firmware; physical cards remain unvalidated.
+`./scripts/gate.sh` runs the tests without and with the FAT feature, then
+builds instantiated archives with and without FAT for Cortex-M0+, Cortex-M4,
+Cortex-M33, RV32 and AArch64 freestanding targets. The build probes use
+unresolved board callbacks, so they exercise every driver path without an OS
+or heap; they are compile and link-input checks, not execution on those
+processors. Protocol tests run against an independent SPI-mode card peer with
+its own CRC implementations, and against a fake native host.

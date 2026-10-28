@@ -1,0 +1,15 @@
+module sh.sysl.sd
+@no_alloc
+#if feature_fat
+
+import sh.sysl.fat.DeviceError
+
+// What both backends' fat.BlockDevice adapters report: range and buffer
+// errors keep their meaning, and every other driver failure is DeviceError.Io.
+// The card's own methods keep the full Error.
+private[sd] device_result(result: Result[unit,Error]) -> Result[unit,DeviceError] = result match
+    Ok(_) -> Ok(())
+    Err(Error.BadLength) -> Err(DeviceError.BadLength)
+    Err(Error.OutOfRange) -> Err(DeviceError.OutOfRange)
+    Err(_) -> Err(DeviceError.Io)
+#endif

@@ -1,6 +1,8 @@
 module sh.sysl.sd
 @tests
 
+import sh.sysl.spi.Error as BusError
+
 @test("CRC: SD command golden vectors and CCITT data vector, including empty input")
 crc_vectors()
     assert(crc7([0x40u8,0,0,0,0]) == 0x4a)
@@ -67,3 +69,83 @@ csd_capacity_v1()
     c[0] = 0xc0
     assert(csd_info(c[..],true) == Err(Error.UnsupportedCsd(3)))
     assert(csd_info(c[..<15],true) == Err(Error.BadLength))
+
+@test("settings: the defaults validate, and a named argument changes only its own field")
+settings_defaults()
+    val d = settings()
+    assert(d.validate().is_ok())
+    assert(d.initial_hz == 400000 && d.transfer_hz == 8000000 && d.initialize_us == 1000000)
+    assert(d.read_us == 200000 && d.program_us == 500000 && d.poll_limit == 1000000 && d.check_crc)
+    val s = settings(read_us = 7, check_crc = false)
+    assert(s.read_us == 7 && !s.check_crc && s.program_us == 500000 && s.transfer_hz == 8000000)
+
+@test("settings: each clock bound is inclusive and each deadline must be non-zero")
+settings_bounds()
+    assert(settings(initial_hz = 100000).validate().is_ok())
+    assert(settings(initial_hz = 99999).validate() == Err(Error.InvalidSettings))
+    assert(settings(initial_hz = 400001).validate() == Err(Error.InvalidSettings))
+    assert(settings(transfer_hz = 25000000).validate().is_ok())
+    assert(settings(transfer_hz = 25000001).validate() == Err(Error.InvalidSettings))
+    assert(settings(initial_hz = 300000, transfer_hz = 300000).validate().is_ok())
+    assert(settings(initial_hz = 300000, transfer_hz = 299999).validate() == Err(Error.InvalidSettings))
+    assert(settings(initialize_us = 0).validate() == Err(Error.InvalidSettings))
+    assert(settings(read_us = 0).validate() == Err(Error.InvalidSettings))
+    assert(settings(program_us = 0).validate() == Err(Error.InvalidSettings))
+    assert(settings(poll_limit = 0).validate() == Err(Error.InvalidSettings))
+
+@test("sector argument: block numbers on SDHC, byte offsets on SDSC, every refusal before any transfer")
+sector_argument()
+    val hc = Some(Info(CardKind.Sdhc,4294967296,false))
+    assert(argument(None,0,SECTOR_SIZE) == Err(Error.NotInitialized))
+    assert(argument(hc,0,SECTOR_SIZE - 1) == Err(Error.BadLength))
+    assert(argument(hc,4294967295,SECTOR_SIZE) == Ok(0xffffffff))
+    assert(argument(hc,4294967296,SECTOR_SIZE) == Err(Error.OutOfRange))
+    val sc = Some(Info(CardKind.Sdsc,8388608,false))
+    assert(argument(sc,3,SECTOR_SIZE) == Ok(1536))
+    assert(argument(sc,8388607,SECTOR_SIZE) == Ok(0xfffffe00))
+    assert(argument(sc,8388608,SECTOR_SIZE) == Err(Error.OutOfRange))
+    val small = Some(Info(CardKind.Sdsc,8388610,false))
+    assert(argument(small,8388608,SECTOR_SIZE) == Err(Error.OutOfRange),"a byte offset past 32 bits")
+
+@test("sector span: whole sectors that end on the card, an empty run at the end included")
+sector_span()
+    val card = Some(Info(CardKind.Sdhc,8,false))
+    assert(span(None,0,0) == Err(Error.NotInitialized))
+    assert(span(card,0,8 * SECTOR_SIZE).is_ok() && span(card,8,0).is_ok())
+    assert(span(card,1,8 * SECTOR_SIZE) == Err(Error.OutOfRange))
+    assert(span(card,9,0) == Err(Error.OutOfRange))
+    assert(span(card,0,SECTOR_SIZE + 1) == Err(Error.BadLength))
+
+@test("finish: the operation's error wins, and the cleanup's is reported after a success")
+finish_order()
+    val one: Result[int,Error] = Ok(1)
+    val failed: Result[int,Error] = Err(Error.Crc)
+    assert(finish(one,Ok(())) == Ok(1))
+    assert(finish(failed,Err(Error.Echo)) == Err(Error.Crc))
+    assert(finish(one,Err(Error.Echo)) == Err(Error.Echo))
+    assert(finish(failed,Ok(())) == Err(Error.Crc))
+
+private bus_failure() -> Result[unit,Error]
+    val failed: Result[unit,BusError] = Err(BusError.Timeout)
+    failed?
+    Ok(())
+
+private host_failure() -> Result[unit,Error]
+    val failed: Result[unit,HostError] = Err(HostError.DataCrc)
+    failed?
+    Ok(())
+
+@test("errors: `?` carries SPI and host transport failures into their own variants")
+error_conversions()
+    assert(bus_failure() == Err(Error.Bus(BusError.Timeout)))
+    assert(host_failure() == Err(Error.Host(HostError.DataCrc)))
+
+#if feature_fat
+@test("FAT adapter errors: range and length keep their meaning, every other failure is Io")
+fat_device_result()
+    assert(device_result(Ok(())).is_ok())
+    assert(device_result(Err(Error.BadLength)) == Err(sh.sysl.fat.DeviceError.BadLength))
+    assert(device_result(Err(Error.OutOfRange)) == Err(sh.sysl.fat.DeviceError.OutOfRange))
+    assert(device_result(Err(Error.Host(HostError.Io))) == Err(sh.sysl.fat.DeviceError.Io))
+    assert(device_result(Err(Error.R1(4))) == Err(sh.sysl.fat.DeviceError.Io))
+#endif

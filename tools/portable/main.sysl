@@ -15,7 +15,8 @@ struct Transport
 end Transport
 impl Device for Transport
     configure(*self, cfg: Config) -> Result[unit,BusError] = if port_clock(cfg.hz) then Ok(()) else Err(BusError.Io)
-    select(*self, active: bool) -> Result[unit,BusError] = if port_select(active) then Ok(()) else Err(BusError.Io)
+    select(*self) -> Result[unit,BusError] = if port_select(true) then Ok(()) else Err(BusError.Io)
+    deselect(*self) -> Result[unit,BusError] = if port_select(false) then Ok(()) else Err(BusError.Io)
     exchange(*self, byte: u8) -> Result[u8,BusError]
         var out: u8 = 0xff
         if port_exchange(byte,&out) then Ok(out) else Err(BusError.Io)
@@ -50,25 +51,28 @@ probe() -> int
     0
 
 import sh.sysl.sd.native as native
-import sh.sysl.sd.Error
+import sh.sysl.sd.{Error,HostError}
 extern "sd_native_configure" native_configure(hz: u32, width: u32) -> bool
-extern "sd_native_command" native_command(index: u32, arg: u32, response: u32, words: *u32) -> bool
-extern "sd_native_read" native_read(index: u32, arg: u32, bytes: *u8, count: usize) -> bool
-extern "sd_native_write" native_write(index: u32, arg: u32, bytes: *u8, count: usize) -> bool
+extern "sd_native_command" native_command(index: u8, arg: u32, response: u32, words: *u32) -> bool
+extern "sd_native_read" native_read(index: u8, arg: u32, bytes: *u8, count: usize) -> bool
+extern "sd_native_write" native_write(index: u8, arg: u32, bytes: *u8, count: usize) -> bool
+private done(ok: bool) -> Result[unit,Error] = if ok then Ok(()) else Err(Error.Host(HostError.Io))
 struct NativeTransport
 end NativeTransport
 impl native.Host for NativeTransport
-    configure(*self, hz: u32, width: u32) -> Result[unit,Error] = if native_configure(hz,width) then Ok(()) else Err(Error.Crc)
-    command(*self, index: u32, arg: u32, response: native.Response) -> Result[[4]u32,Error]
+    configure(*self, hz: u32, width: native.BusWidth) -> Result[unit,Error]
+        done(native_configure(hz,if width == native.BusWidth.Four then 4 else 1))
+    command(*self, index: u8, arg: u32, response: native.Response) -> Result[[4]u32,Error]
         var words: [4]u32
         val kind: u32 = response match
-            native.Response.None -> 0
-            native.Response.Short -> 1
-            native.Response.Long -> 3
-            native.Response.NoCrc -> 2
-        if native_command(index,arg,kind,&words[0]) then Ok(words) else Err(Error.Crc)
-    read_data(*self, index: u32, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error] = if native_read(index,arg,&out[0],out.len) then Ok(()) else Err(Error.Crc)
-    write_data(*self, index: u32, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[unit,Error] = if native_write(index,arg,&bytes[0],bytes.len) then Ok(()) else Err(Error.Crc)
+            native.Response.Empty -> 0
+            native.Response.R1 -> 1
+            native.Response.R3 -> 2
+            native.Response.R2 -> 3
+        done(native_command(index,arg,kind,&words[0]))?
+        Ok(words)
+    read_data(*self, index: u8, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error] = done(native_read(index,arg,&out[0],out.len))
+    write_data(*self, index: u8, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[unit,Error] = done(native_write(index,arg,&bytes[0],bytes.len))
 struct NativeClock
 end NativeClock
 impl Clock for NativeClock

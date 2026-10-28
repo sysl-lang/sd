@@ -1,11 +1,12 @@
 module sh.sysl.sd.spi
 @no_alloc
 
-import sh.sysl.sd.{Clock,Error,Phase,Info,CardKind,Settings,settings,csd_info,crc7,crc16,SECTOR_SIZE}
+import sh.sysl.sd.*
 
 import sh.sysl.spi.{Device,config as spi_config}
 
-// Card owns an SPI Device and a separate monotonic Clock. The application serializes whole card operations.
+// Card owns an SPI Device and a separate monotonic Clock. The application
+// serializes whole card operations.
 struct Card[D: Device, K: Clock]
     private[spi] bus: D
     private[spi] clock: K
@@ -13,212 +14,192 @@ struct Card[D: Device, K: Clock]
     private[spi] ready: bool
     private[spi] info: Info
 
+    into_transport(self) -> D = self.bus
+    into_clock(self) -> K = self.clock
+
+impl[D: Device, K: Clock] Media for Card[D,K]
     initialize(*self) -> Result[Info,Error]
         self.ready = false
-        self.info = Info(CardKind.Sdsc,0,false)
-        val c = self.config
-        if c.initial_hz < 100000 || c.initial_hz > 400000 || c.transfer_hz < c.initial_hz || c.transfer_hz > 25000000 || c.initialize_us == 0 || c.read_us == 0 || c.program_us == 0 || c.poll_limit == 0 then return Err(Error.InvalidSettings)
-        val outcome = initialize_card(self)
-        val cleanup = release(self)
-        val info = outcome?
-        cleanup?
+        self.info = NO_INFO
+        self.config.validate()?
+        val info = finish(initialize_card(self),release(self))?
+        self.bus.configure(spi_config(self.config.transfer_hz))?
         self.info = info
         self.ready = true
         Ok(info)
 
-    information(self) -> Option[Info] = if self.ready then Some(self.info) else None
-    into_transport(self) -> D = self.bus
-    into_clock(self) -> K = self.clock
+    information(*self) -> Option[Info] = if self.ready then Some(self.info) else None
 
     read_sector(*self, sector: u64, out: []u8) -> Result[unit,Error]
-        val address = sector_address(self,sector,out.len)?
-        val outcome = read_selected(self,address,out)
-        val cleanup = release(self)
-        outcome?
-        cleanup?
-        Ok(())
+        val address = argument(self.information(),sector,out.len)?
+        finish(read_selected(self,address,out),release(self))
 
     write_sector(*self, sector: u64, data: []const u8) -> Result[unit,Error]
-        val address = sector_address(self,sector,data.len)?
+        val address = argument(self.information(),sector,data.len)?
         if self.info.write_protected then return Err(Error.WriteProtected)
-        val outcome = write_selected(self,address,data)
-        val cleanup = release(self)
-        outcome?
-        cleanup?
+        finish(write_selected(self,address,data),release(self))?
         // Busy ending alone does not report every programming error.
         self.sync()
 
     sync(*self) -> Result[unit,Error]
         if !self.ready then return Err(Error.NotInitialized)
-        val outcome = status_selected(self)
-        val cleanup = release(self)
-        outcome?
-        cleanup?
-        Ok(())
+        finish(status_selected(self),release(self))
 
-card[D: Device, K: Clock](bus: D, clock: K, config: Settings = settings()) -> Card[D,K] = Card(bus,clock,config,false,Info(CardKind.Sdsc,0,false))
+card[D: Device, K: Clock](bus: D, clock: K, config: Settings = settings()) -> Card[D,K] = Card(bus,clock,config,false,NO_INFO)
 
-private sector_address[D: Device, K: Clock](c: *Card[D,K], sector: u64, length: usize) -> Result[u32,Error]
-    if !c.ready then return Err(Error.NotInitialized)
-    if length != SECTOR_SIZE then return Err(Error.BadLength)
-    if sector >= c.info.sectors then return Err(Error.OutOfRange)
-    val address = if c.info.block_addressed() then sector else sector * 512
-    if address > 0xffffffff then return Err(Error.OutOfRange)
-    Ok(u32(address))
+// SPI-mode response and data framing, Physical Layer specification 7.3.
+private const R1_IDLE: u8 = 0x01
+private const R1_ILLEGAL_COMMAND: u8 = 0x04
+// R1's first bit is always zero; the bus idles high.
+private const R1_START: u8 = 0x80
+private const IDLE: u8 = 0xff
+private const START_BLOCK: u8 = 0xfe
+private const DATA_RESPONSE: u8 = 0x1f
+private const DATA_ACCEPTED: u8 = 0x05
+// Ncr is at most eight byte clocks. Allow sixteen polls for conservative
+// controller/card timing, with a fixed finite bound even on a frozen clock.
+private const RESPONSE_POLLS = 16
 
 private release[D: Device, K: Clock](c: *Card[D,K]) -> Result[unit,Error]
     // Attempt both steps even if changing CS reports a transport failure.
-    val deselect = c.bus.select(false)
-    val clock = c.bus.exchange(0xff)
+    val deselect = c.bus.deselect()
+    val clock = c.bus.exchange(IDLE)
     deselect?
     clock?
     Ok(())
 
 private wait_ready[D: Device, K: Clock](c: *Card[D,K], timeout: u32, phase: Phase) -> Result[unit,Error]
     val start = c.clock.now_us()
-    for poll in 0..<c.config.poll_limit
-        if c.bus.exchange(0xff)? == 0xff then return Ok(())
+    for _ in 0..<c.config.poll_limit
+        if c.bus.exchange(IDLE)? == IDLE then return Ok(())
         if c.clock.now_us() - start >= u64(timeout) then break
     Err(Error.Timeout(phase))
 
 // Leaves CS asserted for response suffix/data. Caller always releases it.
 private command[D: Device, K: Clock](c: *Card[D,K], index: u8, argument: u32) -> Result[u8,Error]
-    c.bus.select(true)?
-    if index != 0 then wait_ready(c,c.config.program_us,Phase.Ready)?
-    c.bus.exchange(0xff)?
+    c.bus.select()?
+    if index != GO_IDLE_STATE then wait_ready(c,c.config.program_us,Phase.Ready)?
+    c.bus.exchange(IDLE)?
     var bytes: [6]u8 = [0x40 | index,u8(argument >> 24),u8(argument >> 16),u8(argument >> 8),u8(argument),0]
     bytes[5] = (crc7(bytes[..<5]) << 1) | 1
     c.bus.write(bytes[..])?
-    // Ncr is at most eight byte clocks. Allow sixteen polls for conservative
-    // controller/card timing, with a fixed finite bound even on a frozen clock.
-    for poll in 0..<16
-        val response = c.bus.exchange(0xff)?
-        if response & 0x80 == 0 then return Ok(response)
+    for _ in 0..<RESPONSE_POLLS
+        val response = c.bus.exchange(IDLE)?
+        if response & R1_START == 0 then return Ok(response)
     Err(Error.Timeout(Phase.Response))
 
-private r1[D: Device, K: Clock](c: *Card[D,K], index: u8, argument: u32) -> Result[u8,Error]
-    val outcome = command(c,index,argument)
-    val cleanup = release(c)
-    val response = outcome?
-    cleanup?
-    Ok(response)
+private r1[D: Device, K: Clock](c: *Card[D,K], index: u8, argument: u32) -> Result[u8,Error] = finish(command(c,index,argument),release(c))
 
+// R3 and R7: R1 followed by a 32-bit register, absent when the card calls the
+// command illegal (a v1 card answering SEND_IF_COND).
 private long_selected[D: Device, K: Clock](c: *Card[D,K], index: u8, argument: u32) -> Result[(u8,u32),Error]
     val response = command(c,index,argument)?
-    if response & 4 != 0 then return Ok((response,0))
+    if response & R1_ILLEGAL_COMMAND != 0 then return Ok((response,0))
     var tail: [4]u8
     c.bus.read(tail[..])?
     Ok((response,(u32(tail[0]) << 24) | (u32(tail[1]) << 16) | (u32(tail[2]) << 8) | u32(tail[3])))
 
-private long_response[D: Device, K: Clock](c: *Card[D,K], index: u8, argument: u32) -> Result[(u8,u32),Error]
-    val outcome = long_selected(c,index,argument)
-    val cleanup = release(c)
-    val response = outcome?
-    cleanup?
-    Ok(response)
+private long_response[D: Device, K: Clock](c: *Card[D,K], index: u8, argument: u32) -> Result[(u8,u32),Error] = finish(long_selected(c,index,argument),release(c))
 
 private expect_ready(status: u8) -> Result[unit,Error]
-    if status == 0 then Ok(()) else Err(Error.Response(status))
+    if status == 0 then Ok(()) else Err(Error.R1(status))
 
 private receive[D: Device, K: Clock](c: *Card[D,K], out: []u8) -> Result[unit,Error]
     val start = c.clock.now_us()
-    var token: u8 = 0xff
-    for poll in 0..<c.config.poll_limit
-        token = c.bus.exchange(0xff)?
-        if token != 0xff then break
+    var token = IDLE
+    for _ in 0..<c.config.poll_limit
+        token = c.bus.exchange(IDLE)?
+        if token != IDLE then break
         if c.clock.now_us() - start >= u64(c.config.read_us) then break
-    if token == 0xff then return Err(Error.Timeout(Phase.ReadToken))
-    if token != 0xfe then return Err(Error.ReadToken(token))
+    if token == IDLE then return Err(Error.Timeout(Phase.ReadToken))
+    if token != START_BLOCK then return Err(Error.ReadToken(token))
     c.bus.read(out)?
-    val high = c.bus.exchange(0xff)?
-    val low = c.bus.exchange(0xff)?
+    val high = c.bus.exchange(IDLE)?
+    val low = c.bus.exchange(IDLE)?
     if c.config.check_crc && ((u16(high) << 8) | u16(low)) != crc16(out) then return Err(Error.Crc)
     Ok(())
 
 private read_selected[D: Device, K: Clock](c: *Card[D,K], address: u32, out: []u8) -> Result[unit,Error]
-    expect_ready(command(c,17,address)?)?
+    expect_ready(command(c,READ_SINGLE_BLOCK,address)?)?
     receive(c,out)
 
 private write_selected[D: Device, K: Clock](c: *Card[D,K], address: u32, data: []const u8) -> Result[unit,Error]
-    expect_ready(command(c,24,address)?)?
-    c.bus.exchange(0xff)? // At least eight clocks between R1 and data token.
-    c.bus.exchange(0xfe)?
+    expect_ready(command(c,WRITE_BLOCK,address)?)?
+    c.bus.exchange(IDLE)? // At least eight clocks between R1 and data token.
+    c.bus.exchange(START_BLOCK)?
     c.bus.write(data)?
     val crc = crc16(data)
     c.bus.exchange(u8(crc >> 8))?
     c.bus.exchange(u8(crc))?
     val start = c.clock.now_us()
-    var token: u8 = 0xff
-    for poll in 0..<c.config.poll_limit
-        token = c.bus.exchange(0xff)?
-        if token != 0xff then break
+    var token = IDLE
+    for _ in 0..<c.config.poll_limit
+        token = c.bus.exchange(IDLE)?
+        if token != IDLE then break
         if c.clock.now_us() - start >= u64(c.config.program_us) then break
-    if token == 0xff then return Err(Error.Timeout(Phase.WriteResponse))
-    if token & 0x1f != 5 then return Err(Error.WriteRejected(token))
+    if token == IDLE then return Err(Error.Timeout(Phase.WriteResponse))
+    if token & DATA_RESPONSE != DATA_ACCEPTED then return Err(Error.WriteRejected(token))
     // The card can assert busy after the response byte; keep CS low and clock
     // it until ready. A failed write is never automatically retried.
     wait_ready(c,c.config.program_us,Phase.Program)
 
 private status_selected[D: Device, K: Clock](c: *Card[D,K]) -> Result[unit,Error]
-    val first = command(c,13,0)?
-    val second = c.bus.exchange(0xff)?
+    val first = command(c,SEND_STATUS,0)?
+    val second = c.bus.exchange(IDLE)?
     val status = (u16(first) << 8) | u16(second)
-    if status == 0 then Ok(()) else Err(Error.Status(status))
+    if status == 0 then Ok(()) else Err(Error.R2(status))
 
 private csd_selected[D: Device, K: Clock](c: *Card[D,K], block: bool) -> Result[Info,Error]
-    expect_ready(command(c,9,0)?)?
+    expect_ready(command(c,SEND_CSD,0)?)?
     var bytes: [16]u8
     receive(c,bytes[..])?
     csd_info(bytes[..],block)
 
 private initialize_card[D: Device, K: Clock](c: *Card[D,K]) -> Result[Info,Error]
     c.bus.configure(spi_config(c.config.initial_hz))?
-    c.bus.select(false)?
+    c.bus.deselect()?
+    // Power-up: at least 1 ms after supply ramp, then at least 74 clocks with
+    // CS high before the first command (section 6.4.1).
     c.clock.delay_us(1000)
-    for i in 0..<10 do c.bus.exchange(0xff)? // 80 clocks with CS high.
+    for _ in 0..<10 do c.bus.exchange(IDLE)?
     val start = c.clock.now_us()
     var idle = false
     val timed_attempts = c.config.initialize_us / 1000 + 1
     val attempts = if c.config.poll_limit < timed_attempts then c.config.poll_limit else timed_attempts
-    for attempt in 0..<attempts
-        r1(c,0,0) match
-            Ok(1) ->
+    for _ in 0..<attempts
+        r1(c,GO_IDLE_STATE,0) match
+            Ok(R1_IDLE) ->
                 idle = true
                 break
-            Ok(other) -> return Err(Error.Response(other))
+            Ok(other) -> return Err(Error.R1(other))
             Err(Error.Timeout(Phase.Response)) -> ()
             Err(error) -> return Err(error)
         if c.clock.now_us() - start >= u64(c.config.initialize_us) then break
         c.clock.delay_us(1000)
     if !idle then return Err(Error.Timeout(Phase.Reset))
-    val echo = long_response(c,8,0x1aa)?
-    val version2 = echo.0 == 1
+    val echo = long_response(c,SEND_IF_COND,IF_COND)?
+    val version2 = echo.0 == R1_IDLE
     if version2
-        if echo.1 & 0xff != 0xaa then return Err(Error.Echo)
-        if echo.1 & 0xfff != 0x1aa then return Err(Error.Voltage)
-    elif echo.0 != 5 then return Err(Error.Response(echo.0))
+        if echo.1 & IF_COND_PATTERN != IF_COND & IF_COND_PATTERN then return Err(Error.Echo)
+        if echo.1 & (IF_COND_VOLTAGE | IF_COND_PATTERN) != IF_COND then return Err(Error.Voltage)
+    elif echo.0 != R1_IDLE | R1_ILLEGAL_COMMAND then return Err(Error.R1(echo.0))
     var ready = false
-    for attempt in 0..<attempts
-        val prefix = r1(c,55,0)?
-        if prefix != 1 && prefix != 0 then return Err(Error.Response(prefix))
-        val response = r1(c,41,if version2 then 0x40000000 else 0)?
+    for _ in 0..<attempts
+        val prefix = r1(c,APP_CMD,0)?
+        if prefix != R1_IDLE && prefix != 0 then return Err(Error.R1(prefix))
+        val response = r1(c,ACMD_SD_SEND_OP_COND,if version2 then OCR_CCS else 0)?
         if response == 0
             ready = true
             break
-        if response != 1 then return Err(Error.Response(response))
+        if response != R1_IDLE then return Err(Error.R1(response))
         if c.clock.now_us() - start >= u64(c.config.initialize_us) then break
         c.clock.delay_us(1000)
     if !ready then return Err(Error.Timeout(Phase.Initialize))
-    val ocr = long_response(c,58,0)?
+    val ocr = long_response(c,READ_OCR,0)?
     expect_ready(ocr.0)?
-    if ocr.1 & 0x80000000 == 0 || ocr.1 & 0x00300000 == 0 then return Err(Error.Voltage)
-    val block = ocr.1 & 0x40000000 != 0
+    if ocr.1 & OCR_BUSY == 0 || ocr.1 & OCR_3V3 == 0 then return Err(Error.Voltage)
+    val block = ocr.1 & OCR_CCS != 0
     if block && !version2 then return Err(Error.InvalidCsd)
-    if !block then expect_ready(r1(c,16,512)?)?
-    expect_ready(r1(c,59,if c.config.check_crc then 1 else 0)?)?
-    val outcome = csd_selected(c,block)
-    val cleanup = release(c)
-    val info = outcome?
-    cleanup?
-    c.bus.configure(spi_config(c.config.transfer_hz))?
-    Ok(info)
+    if !block then expect_ready(r1(c,SET_BLOCKLEN,u32(SECTOR_SIZE))?)?
+    expect_ready(r1(c,CRC_ON_OFF,if c.config.check_crc then 1 else 0)?)?
+    csd_selected(c,block)

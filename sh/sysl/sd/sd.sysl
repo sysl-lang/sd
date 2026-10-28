@@ -1,6 +1,7 @@
 module sh.sysl.sd
 @no_alloc
 
+// Bytes in one sector, the unit of every transfer.
 const SECTOR_SIZE: usize = 512
 
 import sh.sysl.spi.Error as BusError
@@ -19,28 +20,51 @@ enum Phase derives Display
     WriteResponse
     Program
 
+// What a native SD host controller reports about a command or data transfer
+// that it could not complete.
+enum HostError derives Display
+    // A controller fault, or an adapter that could not start the transfer.
+    Io
+    // No command response or data within the controller's deadline.
+    Timeout
+    CommandCrc
+    DataCrc
+    // The data FIFO overflowed on a read or ran dry on a write.
+    Overrun
+    Underrun
+
 enum Error derives Eq, Display
+    // The SPI transport failed.
     Bus(error: BusError)
+    // A native host controller failed.
+    Host(error: HostError)
     NotInitialized
     InvalidSettings
     BadLength
     OutOfRange
     WriteProtected
     Timeout(phase: Phase)
-    Response(status: u8)
+    // The card reported an error, in the format its transport carries it:
+    // R1 is SPI mode's one-byte response, R2 its two-byte CMD13 reply, and
+    // CardStatus the 32-bit card status a native host reads.
+    R1(status: u8)
+    R2(status: u16)
+    CardStatus(status: u32)
     Voltage
     Echo
     UnsupportedCsd(structure: u8)
     InvalidCsd
     InvalidScr
-    CardStatus(status: u32)
+    // SPI mode's data CRC16, checked by the driver.
     Crc
     ReadToken(token: u8)
     WriteRejected(token: u8)
-    Status(status: u16)
 
 impl From[BusError] for Error
     from(error: BusError) -> Error = Error.Bus(error)
+
+impl From[HostError] for Error
+    from(error: HostError) -> Error = Error.Host(error)
 
 enum CardKind derives Display
     Sdsc
@@ -52,7 +76,7 @@ struct Info derives Eq
     sectors: u64
     write_protected: bool
 
-    bytes(self) -> u64 = self.sectors * 512
+    bytes(self) -> u64 = self.sectors * u64(SECTOR_SIZE)
     block_addressed(self) -> bool = self.kind != CardKind.Sdsc
 
 struct Settings
@@ -65,11 +89,106 @@ struct Settings
     poll_limit: u32
     check_crc: bool
 
-settings() -> Settings = Settings(400000,8000000,1000000,200000,500000,1000000,true)
+    // Identification runs at 100-400 kHz and data transfer at no more than
+    // 25 MHz (default speed); every deadline and the poll limit are non-zero.
+    validate(self) -> Result[unit,Error]
+        if self.initial_hz < 100000 || self.initial_hz > 400000 then return Err(Error.InvalidSettings)
+        if self.transfer_hz < self.initial_hz || self.transfer_hz > 25000000 then return Err(Error.InvalidSettings)
+        if self.initialize_us == 0 || self.read_us == 0 || self.program_us == 0 || self.poll_limit == 0 then return Err(Error.InvalidSettings)
+        Ok(())
+
+settings(initial_hz: u32 = 400000, transfer_hz: u32 = 8000000, initialize_us: u32 = 1000000, read_us: u32 = 200000, program_us: u32 = 500000, poll_limit: u32 = 1000000, check_crc: bool = true) -> Settings =
+    Settings(initial_hz,transfer_hz,initialize_us,read_us,program_us,poll_limit,check_crc)
+
+// What a card answers, over either transport: initialize it once, then move
+// whole sectors. A multi-sector call takes a buffer of whole sectors.
+trait Media
+    initialize(*self) -> Result[Info,Error]
+    information(*self) -> Option[Info]
+    read_sector(*self, sector: u64, out: []u8) -> Result[unit,Error]
+    write_sector(*self, sector: u64, data: []const u8) -> Result[unit,Error]
+    sync(*self) -> Result[unit,Error]
+    read_sectors(*self, sector: u64, out: []u8) -> Result[unit,Error]
+        span(self.information(),sector,out.len)?
+        for i in 0..<out.len / SECTOR_SIZE do self.read_sector(sector + u64(i),out[i * SECTOR_SIZE..<(i + 1) * SECTOR_SIZE])?
+        Ok(())
+    write_sectors(*self, sector: u64, data: []const u8) -> Result[unit,Error]
+        span(self.information(),sector,data.len)?
+        for i in 0..<data.len / SECTOR_SIZE do self.write_sector(sector + u64(i),data[i * SECTOR_SIZE..<(i + 1) * SECTOR_SIZE])?
+        Ok(())
+
+// What a card reports before initialization has succeeded.
+private[sd] val NO_INFO = Info(CardKind.Sdsc,0,false)
+
+// The first error of an operation and the cleanup that must follow it whatever
+// happened: the operation's error wins, and the cleanup's is reported only when
+// the operation succeeded.
+private[sd] finish[T](outcome: Result[T,Error], cleanup: Result[unit,Error]) -> Result[T,Error]
+    val value = outcome?
+    cleanup?
+    Ok(value)
+
+// The command argument addressing one sector: its block number on a
+// block-addressed card, its byte offset on SDSC.
+private[sd] argument(info: Option[Info], sector: u64, length: usize) -> Result[u32,Error]
+    val card = info match
+        Some(card) -> card
+        None -> return Err(Error.NotInitialized)
+    if length != SECTOR_SIZE then return Err(Error.BadLength)
+    if sector >= card.sectors then return Err(Error.OutOfRange)
+    val address = if card.block_addressed() then sector else sector * u64(SECTOR_SIZE)
+    if address > 0xffffffff then return Err(Error.OutOfRange)
+    Ok(u32(address))
+
+// A run of whole sectors that lies on the card.
+private[sd] span(info: Option[Info], sector: u64, length: usize) -> Result[unit,Error]
+    val card = info match
+        Some(card) -> card
+        None -> return Err(Error.NotInitialized)
+    if length % SECTOR_SIZE != 0 then return Err(Error.BadLength)
+    val count = u64(length / SECTOR_SIZE)
+    if sector > card.sectors || count > card.sectors - sector then return Err(Error.OutOfRange)
+    Ok(())
+
+// Command indices, Physical Layer specification section 4.7.4. An ACMD is
+// sent after APP_CMD.
+private[sd] const GO_IDLE_STATE: u8 = 0
+private[sd] const ALL_SEND_CID: u8 = 2
+private[sd] const SEND_RELATIVE_ADDR: u8 = 3
+private[sd] const SELECT_CARD: u8 = 7
+private[sd] const SEND_IF_COND: u8 = 8
+private[sd] const SEND_CSD: u8 = 9
+private[sd] const STOP_TRANSMISSION: u8 = 12
+private[sd] const SEND_STATUS: u8 = 13
+private[sd] const SET_BLOCKLEN: u8 = 16
+private[sd] const READ_SINGLE_BLOCK: u8 = 17
+private[sd] const READ_MULTIPLE_BLOCK: u8 = 18
+private[sd] const WRITE_BLOCK: u8 = 24
+private[sd] const WRITE_MULTIPLE_BLOCK: u8 = 25
+private[sd] const APP_CMD: u8 = 55
+private[sd] const READ_OCR: u8 = 58
+private[sd] const CRC_ON_OFF: u8 = 59
+private[sd] const ACMD_SET_BUS_WIDTH: u8 = 6
+private[sd] const ACMD_SD_SEND_OP_COND: u8 = 41
+private[sd] const ACMD_SEND_SCR: u8 = 51
+
+// SEND_IF_COND's argument: VHS = 2.7-3.6 V and the check pattern 0xaa, both
+// echoed back by a v2 card (section 4.3.13).
+private[sd] const IF_COND: u32 = 0x1aa
+private[sd] const IF_COND_PATTERN: u32 = 0xff
+private[sd] const IF_COND_VOLTAGE: u32 = 0xf00
+
+// OCR bits (section 5.1). BUSY is set once power-up has finished; CCS marks a
+// block-addressed card, and the same bit in ACMD41's argument is HCS, the host
+// saying it supports one.
+private[sd] const OCR_BUSY: u32 = 0x80000000
+private[sd] const OCR_CCS: u32 = 0x40000000
+private[sd] const OCR_VOLTAGES: u32 = 0x00ff8000
+private[sd] const OCR_3V3: u32 = 0x00300000
 
 // Register bit positions follow SD Association Physical Layer specification,
 // sections 5.3.2/5.3.3. OCR's CCS flag must agree with the CSD structure.
-csd_info(csd: []const u8, block_addressed: bool) -> Result[Info,Error]
+private[sd] csd_info(csd: []const u8, block_addressed: bool) -> Result[Info,Error]
     if csd.len != 16 then return Err(Error.BadLength)
     val structure = csd[0] >> 6
     val classes = (u32(csd[4]) << 4) | (u32(csd[5]) >> 4)
@@ -83,7 +202,7 @@ csd_info(csd: []const u8, block_addressed: bool) -> Result[Info,Error]
         val mult = (u32(csd[9] & 3) << 1) | (u32(csd[10]) >> 7)
         val bytes = (u64(size) + 1) << (mult + 2 + length)
         if bytes > 2147483648 then return Err(Error.InvalidCsd)
-        return Ok(Info(CardKind.Sdsc,bytes / 512,protected))
+        return Ok(Info(CardKind.Sdsc,bytes / u64(SECTOR_SIZE),protected))
     if structure == 1
         if !block_addressed || csd[5] & 15 != 9 then return Err(Error.InvalidCsd)
         val size = (u32(csd[7] & 63) << 16) | (u32(csd[8]) << 8) | u32(csd[9])
@@ -93,11 +212,11 @@ csd_info(csd: []const u8, block_addressed: bool) -> Result[Info,Error]
 
 // CRC7, polynomial x^7+x^3+1, initial zero. The command wire byte is
 // (crc7(header) << 1) | 1. CRC16 is CCITT, polynomial 0x1021, initial zero.
-crc7(data: []const u8) -> u8
+private[sd] crc7(data: []const u8) -> u8
     var crc: u8 = 0
     for byte in data
         var bits = byte
-        for bit in 0..<8
+        for _ in 0..<8
             val feedback = ((crc >> 6) ^ (bits >> 7)) & 1
             crc = (crc << 1) & 127
             if feedback != 0 then crc ^= 9
@@ -105,7 +224,7 @@ crc7(data: []const u8) -> u8
     crc
 
 private val CRC16: [16]u16 = [0x0000,0x1021,0x2042,0x3063,0x4084,0x50a5,0x60c6,0x70e7,0x8108,0x9129,0xa14a,0xb16b,0xc18c,0xd1ad,0xe1ce,0xf1ef]
-crc16(data: []const u8) -> u16
+private[sd] crc16(data: []const u8) -> u16
     var crc: u16 = 0
     for byte in data
         crc = (crc << 4) ^ CRC16[usize((crc >> 12) ^ u16(byte >> 4))]

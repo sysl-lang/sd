@@ -1,27 +1,48 @@
 module sh.sysl.sd.native
 @no_alloc
 
-import sh.sysl.sd.{Clock,Error,Phase,Info,CardKind,Settings,settings,csd_info,SECTOR_SIZE}
+import sh.sysl.sd.*
 
+// The response a command expects, named by the specification's response types
+// (section 4.9). R1 is the 48-bit CRC-checked shape, which R1b, R6 and R7 share;
+// R2 is the 136-bit CID/CSD reply; R3 is the OCR, sent without a valid CRC.
 enum Response
-    None
-    Short
-    Long
-    NoCrc
+    Empty
+    R1
+    R2
+    R3
+
+enum BusWidth
+    One
+    Four
 
 // Controller-specific adapters implement bounded commands and data transfers.
-// Long replies are bits 127..0, MSW first, as in STM32 SDMMC RESP1..RESP4.
+// R2 replies are bits 127..0, MSW first, as in STM32 SDMMC RESP1..RESP4.
 // Data callbacks issue their command and check R1 plus controller data errors.
+// A controller failure is reported as Error.Host; a card error the data path
+// reads from R1 as Error.CardStatus.
 trait Host
     max_blocks(self) -> usize = 65535
-    configure(*self, hz: u32, width: u32) -> Result[unit,Error]
-    command(*self, index: u32, arg: u32, response: Response) -> Result[[4]u32,Error]
-    read_data(*self, index: u32, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error]
-    write_data(*self, index: u32, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[unit,Error]
+    configure(*self, hz: u32, width: BusWidth) -> Result[unit,Error]
+    command(*self, index: u8, arg: u32, response: Response) -> Result[[4]u32,Error]
+    read_data(*self, index: u8, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error]
+    write_data(*self, index: u8, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[unit,Error]
 
-const R1_ERRORS: u32 = 0xfdffe008
-check_status(status: u32) -> Result[unit,Error]
-    if status & R1_ERRORS != 0 then Err(Error.CardStatus(status)) else Ok(())
+// Card status (section 4.10.1). Every error bit, then the CURRENT_STATE field
+// and READY_FOR_DATA, which together say the card can take the next transfer.
+private const STATUS_ERRORS: u32 = 0xfdffe008
+private const CURRENT_STATE: u32 = 0x1e00
+private const STATE_TRAN: u32 = 0x800
+private const READY_FOR_DATA: u32 = 0x100
+// R6's status bits 15..13 (COM_CRC_ERROR, ILLEGAL_COMMAND, ERROR); the RCA is
+// the upper half.
+private const R6_ERRORS: u32 = 0xe000
+private const RCA: u32 = 0xffff0000
+// ACMD6's argument for a four-bit bus.
+private const FOUR_BIT_BUS: u32 = 2
+
+private[native] check_status(status: u32) -> Result[unit,Error]
+    if status & STATUS_ERRORS != 0 then Err(Error.CardStatus(status)) else Ok(())
 
 struct Card[H: Host, K: Clock]
     private[native] host: H
@@ -31,129 +52,126 @@ struct Card[H: Host, K: Clock]
     private[native] info: Info
     private[native] rca: u32
 
-    information(self) -> Option[Info] = if self.ready then Some(self.info) else None
     into_transport(self) -> H = self.host
     into_clock(self) -> K = self.clock
+
+impl[H: Host, K: Clock] Media for Card[H,K]
+    information(*self) -> Option[Info] = if self.ready then Some(self.info) else None
+
     initialize(*self) -> Result[Info,Error]
         self.ready = false
+        self.info = NO_INFO
         val c = self.config
-        if c.initial_hz < 100000 || c.initial_hz > 400000 || c.transfer_hz < c.initial_hz || c.transfer_hz > 25000000 || c.initialize_us == 0 || c.read_us == 0 || c.program_us == 0 || c.poll_limit == 0 then return Err(Error.InvalidSettings)
-        self.host.configure(c.initial_hz,1)?
+        c.validate()?
+        self.host.configure(c.initial_hz,BusWidth.One)?
         self.clock.delay_us(1000) // at least 74 startup clocks
-        self.host.command(0,0,Response.None)?
-        val echo = self.host.command(8,0x1aa,Response.Short)?
-        if echo[0] & 0xf00 != 0x100 then return Err(Error.Voltage)
-        if echo[0] & 255 != 0xaa then return Err(Error.Echo)
+        self.host.command(GO_IDLE_STATE,0,Response.Empty)?
+        val echo = self.host.command(SEND_IF_COND,IF_COND,Response.R1)?
+        if echo[0] & IF_COND_VOLTAGE != IF_COND & IF_COND_VOLTAGE then return Err(Error.Voltage)
+        if echo[0] & IF_COND_PATTERN != IF_COND & IF_COND_PATTERN then return Err(Error.Echo)
         val start = self.clock.now_us()
         var ocr: u32 = 0
         var attempts: u32 = 0
         loop
-            check_status(self.host.command(55,0,Response.Short)?[0])?
-            ocr = self.host.command(41,0x40ff8000,Response.NoCrc)?[0]
-            if ocr & 0x80000000 != 0 then break
+            check_status(self.host.command(APP_CMD,0,Response.R1)?[0])?
+            ocr = self.host.command(ACMD_SD_SEND_OP_COND,OCR_CCS | OCR_VOLTAGES,Response.R3)?[0]
+            if ocr & OCR_BUSY != 0 then break
             attempts += 1
             if self.clock.now_us() - start >= u64(c.initialize_us) || attempts >= c.poll_limit || attempts > c.initialize_us / 1000 then return Err(Error.Timeout(Phase.Initialize))
             self.clock.delay_us(1000)
-        if ocr & 0x00ff8000 == 0 then return Err(Error.Voltage)
-        self.host.command(2,0,Response.Long)?
-        val assigned = self.host.command(3,0,Response.Short)?[0]
-        if assigned & 0xe000 != 0 || assigned >> 16 == 0 then return Err(Error.CardStatus(assigned))
-        self.rca = assigned & 0xffff0000
-        val words = self.host.command(9,self.rca,Response.Long)?
+        if ocr & OCR_VOLTAGES == 0 then return Err(Error.Voltage)
+        self.host.command(ALL_SEND_CID,0,Response.R2)?
+        val assigned = self.host.command(SEND_RELATIVE_ADDR,0,Response.R1)?[0]
+        if assigned & R6_ERRORS != 0 || assigned & RCA == 0 then return Err(Error.CardStatus(assigned))
+        self.rca = assigned & RCA
+        val words = self.host.command(SEND_CSD,self.rca,Response.R2)?
         var csd: [16]u8
-        for i in 0usize..<16 do csd[i] = u8(words[i / 4] >> (24 - u32(i % 4) * 8))
-        val info = csd_info(csd[..],ocr & 0x40000000 != 0)?
-        check_status(self.host.command(7,self.rca,Response.Short)?[0])?
-        if !info.block_addressed() then check_status(self.host.command(16,512,Response.Short)?[0])?
-        check_status(self.host.command(55,self.rca,Response.Short)?[0])?
+        for i in 0..<csd.len do csd[i] = u8(words[i / 4] >> (24 - u32(i % 4) * 8))
+        val info = csd_info(csd[..],ocr & OCR_CCS != 0)?
+        check_status(self.host.command(SELECT_CARD,self.rca,Response.R1)?[0])?
+        if !info.block_addressed() then check_status(self.host.command(SET_BLOCKLEN,u32(SECTOR_SIZE),Response.R1)?[0])?
+        check_status(self.host.command(APP_CMD,self.rca,Response.R1)?[0])?
+        // SCR (section 5.6): structure version 1.0, and SD_BUS_WIDTHS, whose
+        // bit 0 (one-bit) is mandatory and bit 2 is four-bit support.
         var scr: [8]u8
-        self.host.read_data(51,0,scr[..],c.read_us)?
+        self.host.read_data(ACMD_SEND_SCR,0,scr[..],c.read_us)?
         if scr[0] >> 4 != 0 || scr[1] & 1 == 0 then return Err(Error.InvalidScr)
-        val width: u32 = if scr[1] & 4 != 0 then 4 else 1
-        if width == 4
-            check_status(self.host.command(55,self.rca,Response.Short)?[0])?
-            check_status(self.host.command(6,2,Response.Short)?[0])?
+        val width = if scr[1] & 4 != 0 then BusWidth.Four else BusWidth.One
+        if width == BusWidth.Four
+            check_status(self.host.command(APP_CMD,self.rca,Response.R1)?[0])?
+            check_status(self.host.command(ACMD_SET_BUS_WIDTH,FOUR_BIT_BUS,Response.R1)?[0])?
         self.host.configure(c.transfer_hz,width)?
+        transfer_ready(self)?
         self.info = info
         self.ready = true
-        val settled = self.sync()
-        if settled.is_err() then self.ready = false
-        settled?
         Ok(info)
+
     read_sector(*self, sector: u64, out: []u8) -> Result[unit,Error]
-        val address = address(self,sector,out.len)?
-        self.host.read_data(17,address,out,self.config.read_us)
+        val address = argument(self.information(),sector,out.len)?
+        self.host.read_data(READ_SINGLE_BLOCK,address,out,self.config.read_us)
+
     write_sector(*self, sector: u64, bytes: []const u8) -> Result[unit,Error]
-        val address = address(self,sector,bytes.len)?
+        val address = argument(self.information(),sector,bytes.len)?
         if self.info.write_protected then return Err(Error.WriteProtected)
-        self.host.write_data(24,address,bytes,self.config.program_us)?
+        self.host.write_data(WRITE_BLOCK,address,bytes,self.config.program_us)?
         self.sync()
+
     // Bulk transfers are bounded by the host's data-path capacity. Each native
     // multiblock run is explicitly stopped, including after data errors. A
     // failed run is never retried: an already written prefix may be permanent.
-    read_sectors(*self, sector: u64, out: []u8) -> Result[unit,Error]
-        span(self,sector,out.len)?
+    override read_sectors(*self, sector: u64, out: []u8) -> Result[unit,Error]
+        span(self.information(),sector,out.len)?
         val maximum = self.host.max_blocks()
         if maximum == 0 then return Err(Error.InvalidSettings)
         var done: usize = 0
-        while done < out.len / 512
-            val left = out.len / 512 - done
+        while done < out.len / SECTOR_SIZE
+            val left = out.len / SECTOR_SIZE - done
             val count = if left > maximum then maximum else left
-            val arg = address(self,sector + u64(done),512)?
-            val into = out[done * 512..<(done + count) * 512]
-            if count == 1 then self.host.read_data(17,arg,into,self.config.read_us)?
+            val arg = argument(self.information(),sector + u64(done),SECTOR_SIZE)?
+            val into = out[done * SECTOR_SIZE..<(done + count) * SECTOR_SIZE]
+            if count == 1 then self.host.read_data(READ_SINGLE_BLOCK,arg,into,self.config.read_us)?
             else
-                val result = self.host.read_data(18,arg,into,self.config.read_us)
-                val stopped = self.host.command(12,0,Response.Short)
-                result?
-                check_status(stopped?[0])?
+                finish(self.host.read_data(READ_MULTIPLE_BLOCK,arg,into,self.config.read_us),stop(self))?
                 self.sync()?
             done += count
         Ok(())
-    write_sectors(*self, sector: u64, bytes: []const u8) -> Result[unit,Error]
-        span(self,sector,bytes.len)?
+
+    override write_sectors(*self, sector: u64, bytes: []const u8) -> Result[unit,Error]
+        span(self.information(),sector,bytes.len)?
         if self.info.write_protected && bytes.len != 0 then return Err(Error.WriteProtected)
         val maximum = self.host.max_blocks()
         if maximum == 0 then return Err(Error.InvalidSettings)
         var done: usize = 0
-        while done < bytes.len / 512
-            val left = bytes.len / 512 - done
+        while done < bytes.len / SECTOR_SIZE
+            val left = bytes.len / SECTOR_SIZE - done
             val count = if left > maximum then maximum else left
-            val arg = address(self,sector + u64(done),512)?
-            val from = bytes[done * 512..<(done + count) * 512]
-            if count == 1 then self.host.write_data(24,arg,from,self.config.program_us)?
-            else
-                val result = self.host.write_data(25,arg,from,self.config.program_us)
-                val stopped = self.host.command(12,0,Response.Short)
-                result?
-                check_status(stopped?[0])?
+            val arg = argument(self.information(),sector + u64(done),SECTOR_SIZE)?
+            val from = bytes[done * SECTOR_SIZE..<(done + count) * SECTOR_SIZE]
+            if count == 1 then self.host.write_data(WRITE_BLOCK,arg,from,self.config.program_us)?
+            else finish(self.host.write_data(WRITE_MULTIPLE_BLOCK,arg,from,self.config.program_us),stop(self))?
             self.sync()?
             done += count
         Ok(())
+
     sync(*self) -> Result[unit,Error]
         if !self.ready then return Err(Error.NotInitialized)
-        val start = self.clock.now_us()
-        var attempts: u32 = 0
-        loop
-            val status = self.host.command(13,self.rca,Response.Short)?[0]
-            check_status(status)?
-            if status & 0x1f00 == 0x900 then return Ok(())
-            attempts += 1
-            if self.clock.now_us() - start >= u64(self.config.program_us) || attempts >= self.config.poll_limit || attempts > self.config.program_us / 1000 then return Err(Error.Timeout(Phase.Program))
-            self.clock.delay_us(1000)
+        transfer_ready(self)
 
-card[H: Host, K: Clock](host: H, clock: K, config: Settings = settings()) -> Card[H,K] = Card(host,clock,config,false,Info(CardKind.Sdsc,0,false),0)
-private address[H: Host, K: Clock](c: *Card[H,K], sector: u64, length: usize) -> Result[u32,Error]
-    if !c.ready then return Err(Error.NotInitialized)
-    if length != SECTOR_SIZE then return Err(Error.BadLength)
-    if sector >= c.info.sectors then return Err(Error.OutOfRange)
-    val address = if c.info.block_addressed() then sector else sector * 512
-    if address > 0xffffffff then return Err(Error.OutOfRange)
-    Ok(u32(address))
+card[H: Host, K: Clock](host: H, clock: K, config: Settings = settings()) -> Card[H,K] = Card(host,clock,config,false,NO_INFO,0)
 
-private span[H: Host, K: Clock](c: *Card[H,K], sector: u64, length: usize) -> Result[unit,Error]
-    if !c.ready then return Err(Error.NotInitialized)
-    if length % 512 != 0 then return Err(Error.BadLength)
-    val count = u64(length / 512)
-    if sector > c.info.sectors || count > c.info.sectors - sector then return Err(Error.OutOfRange)
-    Ok(())
+// Ends a multiblock run; sent whatever the transfer returned.
+private stop[H: Host, K: Clock](c: *Card[H,K]) -> Result[unit,Error]
+    check_status(c.host.command(STOP_TRANSMISSION,0,Response.R1)?[0])
+
+// Polls SEND_STATUS until the card is in the transfer state and ready for
+// data, bounded by the programming deadline and the poll limit.
+private transfer_ready[H: Host, K: Clock](c: *Card[H,K]) -> Result[unit,Error]
+    val start = c.clock.now_us()
+    var attempts: u32 = 0
+    loop
+        val status = c.host.command(SEND_STATUS,c.rca,Response.R1)?[0]
+        check_status(status)?
+        if status & (CURRENT_STATE | READY_FOR_DATA) == STATE_TRAN | READY_FOR_DATA then return Ok(())
+        attempts += 1
+        if c.clock.now_us() - start >= u64(c.config.program_us) || attempts >= c.config.poll_limit || attempts > c.config.program_us / 1000 then return Err(Error.Timeout(Phase.Program))
+        c.clock.delay_us(1000)

@@ -2,30 +2,16 @@ module sh.sysl.sd.spi
 @no_alloc
 #if feature_fat
 
-import sh.sysl.sd.{Clock,Error,SECTOR_SIZE}
+import sh.sysl.sd.*
 import sh.sysl.spi.Device
 import sh.sysl.fat.{BlockDevice,DeviceError}
 
-private device_error(error: Error) -> DeviceError = error match
-    Error.BadLength -> DeviceError.BadLength
-    Error.OutOfRange -> DeviceError.OutOfRange
-    _ -> DeviceError.Io
-
 impl[D: Device, K: Clock] BlockDevice for Card[D,K]
     sector_size(self) -> usize = SECTOR_SIZE
-    sectors(self) -> u64 = self.information() match
-        Some(info) -> info.sectors
-        None -> 0
-    read(*self, sector: u64, out: []u8) -> Result[unit,DeviceError]
-        self.read_sector(sector,out) match
-            Ok(_) -> Ok(())
-            Err(error) -> Err(device_error(error))
-    write(*self, sector: u64, data: []const u8) -> Result[unit,DeviceError]
-        self.write_sector(sector,data) match
-            Ok(_) -> Ok(())
-            Err(error) -> Err(device_error(error))
-    flush(*self) -> Result[unit,DeviceError]
-        self.sync() match
-            Ok(_) -> Ok(())
-            Err(error) -> Err(device_error(error))
+    sectors(self) -> u64 = if self.ready then self.info.sectors else 0
+    read(*self, sector: u64, out: []u8) -> Result[unit,DeviceError] = device_result(self.read_sector(sector,out))
+    write(*self, sector: u64, data: []const u8) -> Result[unit,DeviceError] = device_result(self.write_sector(sector,data))
+    override read_many(*self, sector: u64, out: []u8) -> Result[unit,DeviceError] = device_result(self.read_sectors(sector,out))
+    override write_many(*self, sector: u64, data: []const u8) -> Result[unit,DeviceError] = device_result(self.write_sectors(sector,data))
+    flush(*self) -> Result[unit,DeviceError] = device_result(self.sync())
 #endif
