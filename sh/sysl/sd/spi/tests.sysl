@@ -30,17 +30,21 @@ reference_crc()
     assert(ref_command([0x40u8,0,0,0,0]) == 0x95)
     assert(ref_command([0x48u8,0,0,1,0xaa]) == 0x87)
 
-// The clock is shared with the bus the way a board timer is: the bus advances it
-// on every byte, and the Card reads it through its own handle.
-var clock_time: u64 = 0
-var clock_tick: u64 = 1
+// The time is owned by each test and shared with the bus the way a board timer is:
+// the bus advances it on every byte, and the Card reads it through its own handle.
+// A tick of zero freezes the bus's contribution.
+struct Time
+    now: u64
+    tick: u64
+end Time
 
 struct FakeClock
+    time: *Time
 end FakeClock
 impl Clock for FakeClock
-    now_us(self) -> u64 = clock_time
+    now_us(self) -> u64 = self.time.now
     delay_us(*self, micros: u32)
-        if clock_tick != 0 then clock_time += u64(micros)
+        if self.time.tick != 0 then self.time.now += u64(micros)
 
 struct Fake
     storage: Buf[u8]
@@ -86,8 +90,9 @@ struct Fake
     command_error: u8
     command_status: u8
     writes: u32
+    time: *Time
 
-private fake(legacy: bool = false, block: bool = true, sectors: u32 = 2048) -> Fake
+private fake(time: *Time, legacy: bool = false, block: bool = true, sectors: u32 = 2048) -> Fake
     var c: [16]u8 = [0;16]
     c[4] = 1
     c[5] = 0x49
@@ -103,10 +108,8 @@ private fake(legacy: bool = false, block: bool = true, sectors: u32 = 2048) -> F
         c[7] = u8(size >> 2)
         c[8] = u8((size & 3) << 6)
     c[15] = ref_command(c[..<15])
-    clock_time = 0
-    clock_tick = 1
     Fake(buf_filled(usize(sectors) * 512,0),legacy,block,c,false,0,0,0,[0;6],0,[0;520],0,0,false,true,2,false,false,0x1aa,
-        if block then 0xc0ff8000 else 0x80ff8000,false,false,0xfe,false,5,0,0,false,false,0,0,[0;514],0,0xffffffffffffffff,1,0,0,0,false,0,255,0,0)
+        if block then 0xc0ff8000 else 0x80ff8000,false,false,0xfe,false,5,0,0,false,false,0,0,[0;514],0,0xffffffffffffffff,1,0,0,0,false,0,255,0,0,time)
 
 private push(c: *Fake, byte: u8)
     assert(c.reply_count < c.reply.len)
@@ -205,7 +208,7 @@ impl Device for Fake
             self.write_stage = 0
         Ok(())
     exchange(*self, byte: u8) -> Result[u8,BusError]
-        clock_time += clock_tick
+        self.time.now += self.time.tick
         self.exchanges += 1
         if self.exchanges == self.fail_at then return Err(BusError.Io)
         if !self.active
@@ -250,8 +253,8 @@ impl Device for Fake
                 dispatch(self)
         Ok(0xff)
 
-private opened(legacy: bool = false, block: bool = true) -> Card[Fake,FakeClock]
-    var c = card(fake(legacy,block),FakeClock())
+private opened(time: *Time, legacy: bool = false, block: bool = true) -> Card[Fake,FakeClock]
+    var c = card(fake(time,legacy,block),FakeClock(time))
     c.initialize().unwrap()
     c
 
@@ -260,7 +263,8 @@ initialization()
     for legacy in [false,true]
         for block in [false,true]
             if legacy && block then continue
-            var c = opened(legacy,block)
+            var time = Time(0,1)
+            var c = opened(&time,legacy,block)
             val info = c.information().unwrap()
             assert(info.sectors == 2048 && info.block_addressed() == block)
             assert(c.bus.hcs == !legacy && c.bus.crc_on && !c.bus.active && c.bus.hz == 8000000)
@@ -270,7 +274,8 @@ initialization()
 @test("SPI sectors: exact read/write, both addressing modes, programming status and last sector")
 sector_roundtrip()
     for block in [false,true]
-        var c = opened(false,block)
+        var time = Time(0,1)
+        var c = opened(&time,false,block)
         var bytes: [512]u8
         for i in 0..<512 do bytes[i] = u8(i ^ (i >> 4))
         var out: [512]u8
@@ -284,7 +289,8 @@ sector_roundtrip()
 
 @test("SPI validation: uninitialized card, settings, length, range and CSD write protection perform no transfer")
 validation()
-    var c = card(fake(),FakeClock())
+    var time = Time(0,1)
+    var c = card(fake(&time),FakeClock(&time))
     var bytes: [512]u8
     assert(c.read_sector(0,bytes[..]) == Err(Error.NotInitialized) && c.sync() == Err(Error.NotInitialized))
     assert(c.bus.exchanges == 0)
@@ -305,7 +311,8 @@ validation()
 @test("SPI initialization errors: echo, voltage, CCS/CSD disagreement and command errors leave CS released")
 initialization_errors()
     for mode in 0..<5
-        var bus = fake()
+        var time = Time(0,1)
+        var bus = fake(&time)
         if mode == 0 then bus.echo = 0x1ab
         elif mode == 1 then bus.echo = 0x2aa
         elif mode == 2 then bus.ocr = 0x40000000
@@ -313,7 +320,7 @@ initialization_errors()
         else
             bus.command_error = 55
             bus.command_status = 8
-        var c = card(bus,FakeClock())
+        var c = card(bus,FakeClock(&time))
         val result = c.initialize()
         if mode == 0 then assert(result == Err(Error.Echo))
         elif mode == 1 || mode == 2 then assert(result == Err(Error.Voltage))
@@ -324,7 +331,8 @@ initialization_errors()
 @test("SPI read errors: data token, timeout, response and CRC failure release CS and permit recovery")
 read_errors()
     for mode in 0..<4
-        var c = opened()
+        var time = Time(0,1)
+        var c = opened(&time)
         c.config.poll_limit = 16
         if mode == 0 then c.bus.read_token = 0x0d
         elif mode == 1 then c.bus.no_data = true
@@ -348,7 +356,8 @@ read_errors()
 @test("SPI write errors: rejection, busy timeout and CMD13 programming failures are never retried")
 write_errors()
     for mode in 0..<4
-        var c = opened()
+        var time = Time(0,1)
+        var c = opened(&time)
         c.config.poll_limit = 16
         if mode == 0 then c.bus.reject = 0x0b
         elif mode == 1 then c.bus.reject = 0x0d
@@ -365,28 +374,42 @@ write_errors()
 @test("SPI timeouts: absent/idle card, delayed responses, frozen clock and wrapping timer are bounded")
 timeouts()
     for mode in 0..<4
-        var bus = fake()
+        var time = Time(0,1)
+        var bus = fake(&time)
         if mode == 0 then bus.absent = true
         elif mode == 1 then bus.forever_idle = true
         elif mode == 2 then bus.response_delay = 17
         else
             bus.forever_idle = true
-            clock_tick = 0
+            time.tick = 0
         var config = settings()
         config.poll_limit = 8
         config.initialize_us = 10000
-        var c = card(bus,FakeClock(),config)
+        var c = card(bus,FakeClock(&time),config)
         val result = c.initialize()
         assert(result == Err(Error.Timeout(if mode == 1 || mode == 3 then Phase.Initialize else Phase.Reset)))
         assert(c.bus.exchanges < 1000 && !c.bus.active)
-    var bus = fake()
-    clock_time = 0xfffffffffffff800
-    var c = card(bus,FakeClock())
+    var wrapping = Time(0xfffffffffffff800,1)
+    var c = card(fake(&wrapping),FakeClock(&wrapping))
     assert(c.initialize().is_ok())
+
+@test("SPI clocks: two cards in one test keep separate clocks")
+separate_clocks()
+    var a = Time(0,1)
+    var b = Time(1000,3)
+    var ca = card(fake(&a),FakeClock(&a))
+    var cb = card(fake(&b),FakeClock(&b))
+    ca.initialize().unwrap()
+    val a_after = a.now
+    assert(a_after > 0 && b.now == 1000)
+    cb.initialize().unwrap()
+    assert(a.now == a_after && b.now > 1000)
+    assert(ca.clock.time == &a && cb.clock.time == &b)
 
 @test("SPI bus failure: a mid-sector error is propagated, CS is released and initialization can be retried")
 bus_failure()
-    var c = opened()
+    var time = Time(0,1)
+    var c = opened(&time)
     c.bus.fail_at = c.bus.exchanges + 64
     var out: [512]u8
     assert(c.read_sector(0,out[..]) == Err(Error.Bus(BusError.Io)) && !c.bus.active)
@@ -396,7 +419,8 @@ bus_failure()
 crc_policy()
     var config = settings()
     config.check_crc = false
-    var c = card(fake(),FakeClock(),config)
+    var time = Time(0,1)
+    var c = card(fake(&time),FakeClock(&time),config)
     c.initialize().unwrap()
     assert(!c.bus.crc_on)
     c.bus.bad_crc = true
@@ -409,7 +433,8 @@ import sh.sysl.fat.{BlockDevice,DeviceError,FatType,format,mount}
 
 @test("FAT adapter: format, mount, file write/read and flush run through actual SPI card commands")
 fat_roundtrip()
-    var c = card(fake(false,true,32768),FakeClock())
+    var time = Time(0,1)
+    var c = card(fake(&time,false,true,32768),FakeClock(&time))
     c.initialize().unwrap()
     assert(c.sector_size() == 512 && c.sectors() == 32768)
     format(&c,Some(FatType.Fat16),label = "SD TEST").unwrap()
@@ -431,7 +456,8 @@ fat_roundtrip()
 @test("SPI address boundaries: 64-bit sector counts retain full 32-bit block/byte arguments")
 address_boundaries()
     var out: [512]u8
-    var hc = opened()
+    var time = Time(0,1)
+    var hc = opened(&time)
     hc.info.sectors = 4294967296
     // The small test peer rejects these sectors, but records the actual wire
     // argument, independently proving that the driver did not truncate early.
@@ -439,7 +465,7 @@ address_boundaries()
     assert(hc.bus.last_read == 0xffffffff)
     val before = hc.bus.exchanges
     assert(hc.read_sector(4294967296,out[..]) == Err(Error.OutOfRange) && hc.bus.exchanges == before)
-    var sc = opened(false,false)
+    var sc = opened(&time,false,false)
     sc.info.sectors = 4194304
     assert(sc.read_sector(4194303,out[..]) == Err(Error.Response(0x20)))
     assert(sc.bus.last_read == 0x7ffffe00)

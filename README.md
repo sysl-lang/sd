@@ -12,7 +12,7 @@ This initial implementation is not validated on physical cards.
 
 ```hocon
 dependencies {
-  sd { git = "github.com/sysl-lang/sd", version = "0.1.0", features = [fat] }
+  sd { git = "github.com/sysl-lang/sd", version = "0.1.1", features = [fat] }
 }
 ```
 
