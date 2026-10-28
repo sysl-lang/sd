@@ -12,13 +12,14 @@ This initial implementation is not validated on physical cards.
 
 ```hocon
 dependencies {
-  sd { git = "github.com/sysl-lang/sd", rev = "dev", features = [fat] }
+  sd { git = "github.com/sysl-lang/sd", version = "0.1.0", features = [fat] }
 }
 ```
 
 Implement `sh.sysl.spi.Device` for your MCU connection (or wrap `spi.Bus` and
-`spi.ChipSelect` with `spi.exclusive`), and implement `sh.sysl.sd.Clock` on the
-transport for SD polling deadlines.
+`spi.ChipSelect` with `spi.exclusive`), and implement `sh.sysl.sd.Clock` as a
+separate value for SD polling deadlines. `card(device, clock, settings)` takes
+both; the clock is a board-wide service, not part of the SPI link.
 The platform supplies a monotonic microsecond clock and bounded hardware waits.
 Default bulk read/write methods use byte exchanges; implementations may override
 them with DMA. The driver owns the transport, uses caller buffers and keeps CS
@@ -28,7 +29,7 @@ asserted through complete command/data transactions.
 import sh.sysl.sd.spi.card
 import sh.sysl.fat.mount
 
-var sd = card(my_spi_transport)
+var sd = card(my_spi_transport,my_clock)
 val info = sd.initialize()?
 var sector: [512]u8
 var volume = mount(&sd,sector[..])?
@@ -80,13 +81,14 @@ cards, MCU transports and Benchtop integration have not yet been validated.
 
 `sh.sysl.sd.native` supports native SD v2 memory-card initialization and
 single-sector and multiblock reads/writes, alongside the existing SPI driver. Implement its
-allocation-free `Host` trait and `sh.sysl.sd.Clock` for a controller adapter:
+allocation-free `Host` trait for a controller adapter and `sh.sysl.sd.Clock` for the
+timebase:
 configure the bus, send commands with none/short/long/no-CRC responses, and
 transfer command-associated data with bounded timeouts. Data callbacks check
 both R1 and controller transfer errors; sector and SCR transfers receive their
 configured timeout explicitly. Native response words are MSW first.
 
-`native.card(host)` exposes the same initialize/information/read_sector/
+`native.card(host, clock)` exposes the same initialize/information/read_sector/
 write_sector/sync API and optional `fat.BlockDevice` interface as SPI. It sends
 CMD0/8, CMD55/ACMD41, CMD2/3/9/7, reads SCR and negotiates four-bit mode when
 available. CSD parsing/capacity, settings, errors and the FAT block-device

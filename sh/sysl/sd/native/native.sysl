@@ -23,8 +23,9 @@ const R1_ERRORS: u32 = 0xfdffe008
 check_status(status: u32) -> Result[unit,Error]
     if status & R1_ERRORS != 0 then Err(Error.CardStatus(status)) else Ok(())
 
-struct Card[H: Host + Clock]
+struct Card[H: Host, K: Clock]
     private[native] host: H
+    private[native] clock: K
     private[native] config: Settings
     private[native] ready: bool
     private[native] info: Info
@@ -32,17 +33,18 @@ struct Card[H: Host + Clock]
 
     information(self) -> Option[Info] = if self.ready then Some(self.info) else None
     into_transport(self) -> H = self.host
+    into_clock(self) -> K = self.clock
     initialize(*self) -> Result[Info,Error]
         self.ready = false
         val c = self.config
         if c.initial_hz < 100000 || c.initial_hz > 400000 || c.transfer_hz < c.initial_hz || c.transfer_hz > 25000000 || c.initialize_us == 0 || c.read_us == 0 || c.program_us == 0 || c.poll_limit == 0 then return Err(Error.InvalidSettings)
         self.host.configure(c.initial_hz,1)?
-        self.host.delay_us(1000) // at least 74 startup clocks
+        self.clock.delay_us(1000) // at least 74 startup clocks
         self.host.command(0,0,Response.None)?
         val echo = self.host.command(8,0x1aa,Response.Short)?
         if echo[0] & 0xf00 != 0x100 then return Err(Error.Voltage)
         if echo[0] & 255 != 0xaa then return Err(Error.Echo)
-        val start = self.host.now_us()
+        val start = self.clock.now_us()
         var ocr: u32 = 0
         var attempts: u32 = 0
         loop
@@ -50,8 +52,8 @@ struct Card[H: Host + Clock]
             ocr = self.host.command(41,0x40ff8000,Response.NoCrc)?[0]
             if ocr & 0x80000000 != 0 then break
             attempts += 1
-            if self.host.now_us() - start >= u64(c.initialize_us) || attempts >= c.poll_limit || attempts > c.initialize_us / 1000 then return Err(Error.Timeout(Phase.Initialize))
-            self.host.delay_us(1000)
+            if self.clock.now_us() - start >= u64(c.initialize_us) || attempts >= c.poll_limit || attempts > c.initialize_us / 1000 then return Err(Error.Timeout(Phase.Initialize))
+            self.clock.delay_us(1000)
         if ocr & 0x00ff8000 == 0 then return Err(Error.Voltage)
         self.host.command(2,0,Response.Long)?
         val assigned = self.host.command(3,0,Response.Short)?[0]
@@ -130,18 +132,18 @@ struct Card[H: Host + Clock]
         Ok(())
     sync(*self) -> Result[unit,Error]
         if !self.ready then return Err(Error.NotInitialized)
-        val start = self.host.now_us()
+        val start = self.clock.now_us()
         var attempts: u32 = 0
         loop
             val status = self.host.command(13,self.rca,Response.Short)?[0]
             check_status(status)?
             if status & 0x1f00 == 0x900 then return Ok(())
             attempts += 1
-            if self.host.now_us() - start >= u64(self.config.program_us) || attempts >= self.config.poll_limit || attempts > self.config.program_us / 1000 then return Err(Error.Timeout(Phase.Program))
-            self.host.delay_us(1000)
+            if self.clock.now_us() - start >= u64(self.config.program_us) || attempts >= self.config.poll_limit || attempts > self.config.program_us / 1000 then return Err(Error.Timeout(Phase.Program))
+            self.clock.delay_us(1000)
 
-card[H: Host + Clock](host: H, config: Settings = settings()) -> Card[H] = Card(host,config,false,Info(CardKind.Sdsc,0,false),0)
-private address[H: Host + Clock](c: *Card[H], sector: u64, length: usize) -> Result[u32,Error]
+card[H: Host, K: Clock](host: H, clock: K, config: Settings = settings()) -> Card[H,K] = Card(host,clock,config,false,Info(CardKind.Sdsc,0,false),0)
+private address[H: Host, K: Clock](c: *Card[H,K], sector: u64, length: usize) -> Result[u32,Error]
     if !c.ready then return Err(Error.NotInitialized)
     if length != SECTOR_SIZE then return Err(Error.BadLength)
     if sector >= c.info.sectors then return Err(Error.OutOfRange)
@@ -149,7 +151,7 @@ private address[H: Host + Clock](c: *Card[H], sector: u64, length: usize) -> Res
     if address > 0xffffffff then return Err(Error.OutOfRange)
     Ok(u32(address))
 
-private span[H: Host + Clock](c: *Card[H], sector: u64, length: usize) -> Result[unit,Error]
+private span[H: Host, K: Clock](c: *Card[H,K], sector: u64, length: usize) -> Result[unit,Error]
     if !c.ready then return Err(Error.NotInitialized)
     if length % 512 != 0 then return Err(Error.BadLength)
     val count = u64(length / 512)

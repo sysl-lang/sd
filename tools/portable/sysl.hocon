@@ -1,3 +1,3 @@
-package { name = "sd-portable", version = "0.0.1", sysl = "0.7.0" }
+package { name = "sd-portable", version = "0.0.1", sysl = "0.7.5" }
 features { fat = ["sd/fat"] }
 dependencies { sd { workspace = true } }

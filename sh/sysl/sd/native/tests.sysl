@@ -2,14 +2,21 @@ module sh.sysl.sd.native
 @tests
 import sh.sysl.sd.{Clock,Error,Phase,CardKind,settings}
 
-private struct Fake
+private struct Ticker
     now: u64
+    frozen: bool
+
+private ticker() -> Ticker = Ticker(0,false)
+impl Clock for Ticker
+    now_us(self) -> u64 = self.now
+    delay_us(*self, micros: u32) = if !self.frozen then self.now += u64(micros)
+
+private struct Fake
     clock: u32
     width: u32
     calls: u32
     attempts: u32
     busy: u32
-    frozen: bool
     not_ready: bool
     bad_echo: bool
     bad_scr: bool
@@ -24,10 +31,7 @@ private struct Fake
     fail_data: bool
     fail_stop: bool
     data: [4096]u8
-private fake() -> Fake = Fake(0,0,1,0,0,0,false,false,false,false,false,false,false,0,65535,0,0,0,false,false,[0;4096])
-impl Clock for Fake
-    now_us(self) -> u64 = self.now
-    delay_us(*self, micros: u32) = if !self.frozen then self.now += u64(micros)
+private fake() -> Fake = Fake(0,1,0,0,0,false,false,false,false,false,false,0,65535,0,0,0,false,false,[0;4096])
 impl Host for Fake
     override max_blocks(self) -> usize = self.maximum
     configure(*self, hz: u32, width: u32) -> Result[unit,Error]
@@ -87,20 +91,20 @@ impl Host for Fake
 
 @test("native SD: initialization assigns RCA, parses CSD/SCR and negotiates four-bit transfer speed")
 initialize_native()
-    var c = card(fake())
+    var c = card(fake(),ticker())
     val info = c.initialize().unwrap()
     assert(info.kind == CardKind.Sdhc && info.sectors == 32768 && !info.write_protected)
     assert(c.host.width == 4 && c.host.clock == 8000000 && c.host.attempts == 3)
     assert(c.information() == Some(info))
     var b = fake()
     b.one_bit = true
-    c = card(b)
+    c = card(b,ticker())
     c.initialize().unwrap()
     assert(c.host.width == 1)
 
 @test("native SD: bounded sector transfers, readiness polling, addressing and write protection")
 sectors_native()
-    var c = card(fake())
+    var c = card(fake(),ticker())
     var bytes: [512]u8 = [0;512]
     assert(c.read_sector(0,bytes[..]).err() == Some(Error.NotInitialized))
     c.initialize().unwrap()
@@ -114,7 +118,7 @@ sectors_native()
     assert(c.read_sector(0,out[..<511]).err() == Some(Error.BadLength))
     var protected = fake()
     protected.protected = true
-    c = card(protected)
+    c = card(protected,ticker())
     assert(c.initialize().unwrap().write_protected)
     assert(c.write_sector(0,bytes[..]).err() == Some(Error.WriteProtected))
 
@@ -122,32 +126,33 @@ sectors_native()
 failures_native()
     var config = settings()
     config.initial_hz = 0
-    var c = card(fake(),config)
+    var c = card(fake(),ticker(),config)
     assert(c.initialize().err() == Some(Error.InvalidSettings) && c.host.calls == 0)
     var b = fake()
     b.bad_echo = true
-    c = card(b)
+    c = card(b,ticker())
     assert(c.initialize().err() == Some(Error.Echo) && c.information().is_none())
     b = fake()
     b.bad_scr = true
-    c = card(b)
+    c = card(b,ticker())
     assert(c.initialize().err() == Some(Error.InvalidScr) && c.information().is_none())
     b = fake()
-    b.frozen = true
     b.not_ready = true
+    var frozen = ticker()
+    frozen.frozen = true
     config = settings()
     config.initialize_us = 2000
-    c = card(b,config)
+    c = card(b,frozen,config)
     assert(c.initialize().err() == Some(Error.Timeout(Phase.Initialize)) && c.host.attempts < 10)
     b = fake()
     b.fail = true
-    c = card(b)
+    c = card(b,ticker())
     assert(c.initialize().err() == Some(Error.Crc) && c.information().is_none())
     assert(check_status(1 << 26).err() == Some(Error.CardStatus(1 << 26)))
 
 @test("native SD: data errors propagate and programming timeouts never retry accepted writes")
 program_native()
-    var c = card(fake())
+    var c = card(fake(),ticker())
     c.initialize().unwrap()
     c.host.fail = true
     var bytes: [512]u8
@@ -155,7 +160,7 @@ program_native()
     assert(c.write_sector(0,bytes[..]).err() == Some(Error.Crc))
     c.host.fail = false
     c.host.busy = 100
-    c.host.frozen = true
+    c.clock.frozen = true
     c.config.program_us = 2000
     assert(c.sync().err() == Some(Error.Timeout(Phase.Program)))
 
@@ -163,7 +168,7 @@ program_native()
 bulk_native()
     var bus = fake()
     bus.maximum = 3
-    var c = card(bus)
+    var c = card(bus,ticker())
     c.initialize().unwrap()
     var bytes: [4096]u8 = [0;4096]
     for i in 0..<4096 do bytes[i] = u8(i * 13 + i / 512)
@@ -183,7 +188,7 @@ bulk_native()
 
 @test("native SD bulk: stop is attempted after data failure, successful data requires stop success and writes are never retried")
 bulk_failures()
-    var c = card(fake())
+    var c = card(fake(),ticker())
     c.initialize().unwrap()
     c.host.fail_data = true
     var bytes: [1024]u8 = [0;1024]

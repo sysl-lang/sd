@@ -7,7 +7,7 @@ private device_error(error: Error) -> DeviceError = error match
     Error.BadLength -> DeviceError.BadLength
     Error.OutOfRange -> DeviceError.OutOfRange
     _ -> DeviceError.Io
-impl[H: Host + Clock] BlockDevice for Card[H]
+impl[H: Host, K: Clock] BlockDevice for Card[H,K]
     sector_size(self) -> usize = SECTOR_SIZE
     sectors(self) -> u64 = self.information() match
         Some(info) -> info.sectors

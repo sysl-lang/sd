@@ -1,8 +1,8 @@
-package { name = "sd", version = "0.1.0", sysl = "0.7.0" }
+package { name = "sd", version = "0.1.0", sysl = "0.7.5" }
 optimization = "2"
 workspace = ["tools/*"]
 features { fat = [fat] }
 dependencies {
-  spi { git = "github.com/sysl-lang/spi", rev = "7852bfa1f2e7a23e3cbbe650ba179632ab9caa2d" }
-  fat { git = "github.com/sysl-lang/fat", rev = "46da2454b2baadffda17a450d2066149819b22e7", optional = true }
+  spi { git = "github.com/sysl-lang/spi", version = "0.1.0" }
+  fat { git = "github.com/sysl-lang/fat", version = "0.2.0", optional = true }
 }
