@@ -9,7 +9,7 @@ private struct Ticker
 private ticker() -> Ticker = Ticker(0,false)
 impl Clock for Ticker
     now_us(self) -> u64 = self.now
-    delay_us(*self, micros: u32) = if !self.frozen then self.now += u64(micros)
+    delay_us(*self, micros: u32) = if !self.frozen then self.now +%= u64(micros)
 
 private struct Fake
     clock: u32
@@ -119,7 +119,7 @@ sectors_native()
     var bytes: [512]u8 = [0;512]
     assert(c.read_sector(0,bytes[..]).err() == Some(Error.NotInitialized))
     c.initialize().unwrap()
-    for i in 0..<512 do bytes[i] = u8(i * 7)
+    for i in 0..<512 do bytes[i] = u8.wrap(i * 7)
     c.write_sector(32767,bytes[..]).unwrap()
     assert(c.host.address == 32767 && c.host.busy == 0)
     var out: [512]u8
@@ -151,6 +151,15 @@ bad_scr_native()
     b.bad_scr = true
     var c = card(b,ticker())
     assert(c.initialize().err() == Some(Error.InvalidScr) && c.information().is_none())
+
+@test("native SD: a clock that wraps while the card powers up still initializes")
+wrapping_clock_native()
+    var b = fake()
+    b.busy = 3
+    var wrapping = ticker()
+    wrapping.now = 0xfffffffffffffc00
+    var c = card(b,wrapping)
+    assert(c.initialize().is_ok())
 
 @test("native SD: a card that never powers up on a frozen clock is bounded by the poll limit")
 frozen_initialization_native()
@@ -258,7 +267,7 @@ bulk_native()
     var c = card(bus,ticker())
     c.initialize().unwrap()
     var bytes: [4096]u8 = [0;4096]
-    for i in 0..<4096 do bytes[i] = u8(i * 13 + i / 512)
+    for i in 0..<4096 do bytes[i] = u8.wrap(i * 13 + i / 512)
     c.write_sectors(0,bytes[..]).unwrap()
     assert(c.host.multi_writes == 3 && c.host.stops == 3 && c.host.address == 6)
     var out: [4096]u8

@@ -72,7 +72,7 @@ private wait_ready[D: Device, K: Clock](c: *Card[D,K], timeout: u32, phase: Phas
     val start = c.clock.now_us()
     for _ in 0..<c.config.poll_limit
         if c.bus.exchange(IDLE)? == IDLE then return Ok(())
-        if c.clock.now_us() - start >= u64(timeout) then break
+        if c.clock.now_us() -% start >= u64(timeout) then break
     Err(Error.Timeout(phase))
 
 // Leaves CS asserted for response suffix/data. Caller always releases it.
@@ -80,7 +80,7 @@ private command[D: Device, K: Clock](c: *Card[D,K], index: u8, argument: u32) ->
     c.bus.select()?
     if index != GO_IDLE_STATE then wait_ready(c,c.config.program_us,Phase.Ready)?
     c.bus.exchange(IDLE)?
-    var bytes: [6]u8 = [0x40 | index,u8(argument >> 24),u8(argument >> 16),u8(argument >> 8),u8(argument),0]
+    var bytes: [6]u8 = [0x40 | index,u8.wrap(argument >> 24),u8.wrap(argument >> 16),u8.wrap(argument >> 8),u8.wrap(argument),0]
     bytes[5] = (crc7(bytes[..<5]) << 1) | 1
     c.bus.write(bytes[..])?
     for _ in 0..<RESPONSE_POLLS
@@ -110,7 +110,7 @@ private receive[D: Device, K: Clock](c: *Card[D,K], out: []u8) -> Result[unit,Er
     for _ in 0..<c.config.poll_limit
         token = c.bus.exchange(IDLE)?
         if token != IDLE then break
-        if c.clock.now_us() - start >= u64(c.config.read_us) then break
+        if c.clock.now_us() -% start >= u64(c.config.read_us) then break
     if token == IDLE then return Err(Error.Timeout(Phase.ReadToken))
     if token != START_BLOCK then return Err(Error.ReadToken(token))
     c.bus.read(out)?
@@ -129,14 +129,14 @@ private write_selected[D: Device, K: Clock](c: *Card[D,K], address: u32, data: [
     c.bus.exchange(START_BLOCK)?
     c.bus.write(data)?
     val crc = crc16(data)
-    c.bus.exchange(u8(crc >> 8))?
-    c.bus.exchange(u8(crc))?
+    c.bus.exchange(u8.wrap(crc >> 8))?
+    c.bus.exchange(u8.wrap(crc))?
     val start = c.clock.now_us()
     var token = IDLE
     for _ in 0..<c.config.poll_limit
         token = c.bus.exchange(IDLE)?
         if token != IDLE then break
-        if c.clock.now_us() - start >= u64(c.config.program_us) then break
+        if c.clock.now_us() -% start >= u64(c.config.program_us) then break
     if token == IDLE then return Err(Error.Timeout(Phase.WriteResponse))
     if token & DATA_RESPONSE != DATA_ACCEPTED then return Err(Error.WriteRejected(token))
     // The card can assert busy after the response byte; keep CS low and clock
@@ -174,7 +174,7 @@ private initialize_card[D: Device, K: Clock](c: *Card[D,K]) -> Result[Info,Error
             Ok(other) -> return Err(Error.R1(other))
             Err(Error.Timeout(Phase.Response)) -> ()
             Err(error) -> return Err(error)
-        if c.clock.now_us() - start >= u64(c.config.initialize_us) then break
+        if c.clock.now_us() -% start >= u64(c.config.initialize_us) then break
         c.clock.delay_us(1000)
     if !idle then return Err(Error.Timeout(Phase.Reset))
     val echo = long_response(c,SEND_IF_COND,IF_COND)?
@@ -192,7 +192,7 @@ private initialize_card[D: Device, K: Clock](c: *Card[D,K]) -> Result[Info,Error
             ready = true
             break
         if response != R1_IDLE then return Err(Error.R1(response))
-        if c.clock.now_us() - start >= u64(c.config.initialize_us) then break
+        if c.clock.now_us() -% start >= u64(c.config.initialize_us) then break
         c.clock.delay_us(1000)
     if !ready then return Err(Error.Timeout(Phase.Initialize))
     val ocr = long_response(c,READ_OCR,0)?

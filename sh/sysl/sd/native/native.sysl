@@ -88,7 +88,7 @@ impl[H: Host, K: Clock] Media for Card[H,K]
             ocr = self.host.command(ACMD_SD_SEND_OP_COND,OCR_CCS | OCR_VOLTAGES,Response.R3)?[0]
             if ocr & OCR_BUSY != 0 then break
             attempts += 1
-            if self.clock.now_us() - start >= u64(c.initialize_us) || attempts >= c.poll_limit || attempts > c.initialize_us / 1000 then return Err(Error.Timeout(Phase.Initialize))
+            if self.clock.now_us() -% start >= u64(c.initialize_us) || attempts >= c.poll_limit || attempts > c.initialize_us / 1000 then return Err(Error.Timeout(Phase.Initialize))
             self.clock.delay_us(1000)
         if ocr & OCR_VOLTAGES == 0 then return Err(Error.Voltage)
         self.host.command(ALL_SEND_CID,0,Response.R2)?
@@ -97,7 +97,7 @@ impl[H: Host, K: Clock] Media for Card[H,K]
         self.rca = assigned & RCA
         val words = self.host.command(SEND_CSD,self.rca,Response.R2)?
         var csd: [16]u8
-        for i in 0..<csd.len do csd[i] = u8(words[i / 4] >> (24 - u32(i % 4) * 8))
+        for i in 0..<csd.len do csd[i] = u8.wrap(words[i / 4] >> (24 - u32(i % 4) * 8))
         val info = csd_info(csd[..],ocr & OCR_CCS != 0)?
         check_status(self.host.command(SELECT_CARD,self.rca,Response.R1)?[0])?
         if !info.block_addressed() then check_status(self.host.command(SET_BLOCKLEN,u32(SECTOR_SIZE),Response.R1)?[0])?
@@ -192,5 +192,5 @@ private transfer_ready[H: Host, K: Clock](c: *Card[H,K]) -> Result[unit,Error]
         check_status(status)?
         if status & (CURRENT_STATE | READY_FOR_DATA) == STATE_TRAN | READY_FOR_DATA then return Ok(())
         attempts += 1
-        if c.clock.now_us() - start >= u64(c.config.program_us) || attempts >= c.config.poll_limit || attempts > c.config.program_us / 1000 then return Err(Error.Timeout(Phase.Program))
+        if c.clock.now_us() -% start >= u64(c.config.program_us) || attempts >= c.config.poll_limit || attempts > c.config.program_us / 1000 then return Err(Error.Timeout(Phase.Program))
         c.clock.delay_us(1000)

@@ -17,9 +17,9 @@ private csd2(size: u32) -> [16]u8
     c[0] = 0x40
     c[4] = 1
     c[5] = 0x49
-    c[7] = u8(size >> 16)
-    c[8] = u8(size >> 8)
-    c[9] = u8(size)
+    c[7] = u8.wrap(size >> 16)
+    c[8] = u8.wrap(size >> 8)
+    c[9] = u8.wrap(size)
     c
 
 @test("CSD v2: minimum field, SDHC/SDXC boundary, full 2TiB capacity and write protection")

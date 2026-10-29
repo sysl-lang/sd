@@ -44,7 +44,7 @@ end FakeClock
 impl Clock for FakeClock
     now_us(self) -> u64 = self.time.now
     delay_us(*self, micros: u32)
-        if self.time.tick != 0 then self.time.now += u64(micros)
+        if self.time.tick != 0 then self.time.now +%= u64(micros)
 
 struct Fake
     storage: Buf[u8]
@@ -99,13 +99,13 @@ private fake(time: *Time, legacy: bool = false, block: bool = true, sectors: u32
     if block
         c[0] = 0x40
         val size = sectors / 1024 - 1
-        c[7] = u8(size >> 16)
-        c[8] = u8(size >> 8)
-        c[9] = u8(size)
+        c[7] = u8.wrap(size >> 16)
+        c[8] = u8.wrap(size >> 8)
+        c[9] = u8.wrap(size)
     else
         val size = sectors / 4 - 1
-        c[6] = u8(size >> 10)
-        c[7] = u8(size >> 2)
+        c[6] = u8.wrap(size >> 10)
+        c[7] = u8.wrap(size >> 2)
         c[8] = u8((size & 3) << 6)
     c[15] = ref_command(c[..<15])
     Fake(storage = buf_filled(usize(sectors) * 512,0), legacy = legacy, block = block, csd = c,
@@ -132,8 +132,8 @@ private packet(c: *Fake, data: []const u8)
     if c.read_token != 0xfe then return
     for byte in data do push(c,byte)
     val crc = ref_crc(data) ^ (if c.bad_crc then 1u16 else 0)
-    push(c,u8(crc >> 8))
-    push(c,u8(crc))
+    push(c,u8.wrap(crc >> 8))
+    push(c,u8.wrap(crc))
 private sector(c: *Fake, arg: u32) -> Option[u32]
     if !c.block && arg & 511 != 0 then return None
     val at = if c.block then u64(arg) * 512 else u64(arg)
@@ -155,7 +155,7 @@ private dispatch(c: *Fake)
     elif index == 8
         response(c,if c.legacy then 5 else 1)
         if !c.legacy
-            for shift in [24u32,16,8,0] do push(c,u8(c.echo >> shift))
+            for shift in [24u32,16,8,0] do push(c,u8.wrap(c.echo >> shift))
     elif index == 55
         c.app = true
         response(c,if c.idle then 1 else 0)
@@ -168,7 +168,7 @@ private dispatch(c: *Fake)
         response(c,if c.idle then 1 else 0)
     elif index == 58
         response(c,0)
-        for shift in [24u32,16,8,0] do push(c,u8(c.ocr >> shift))
+        for shift in [24u32,16,8,0] do push(c,u8.wrap(c.ocr >> shift))
     elif index == 16
         assert(!c.block && arg == 512)
         c.block_length = arg
@@ -286,7 +286,7 @@ sector_roundtrip()
         var time = Time(0,1)
         var c = opened(&time,false,block)
         var bytes: [512]u8
-        for i in 0..<512 do bytes[i] = u8(i ^ (i >> 4))
+        for i in 0..<512 do bytes[i] = u8.wrap(i ^ (i >> 4))
         var out: [512]u8
         for lba in [0u64,1,2047]
             assert(c.write_sector(lba,bytes[..]).is_ok())
@@ -580,7 +580,7 @@ multi_sector()
         var time = Time(0,1)
         var c = opened(&time,false,block)
         var bytes: [1536]u8
-        for i in 0..<bytes.len do bytes[i] = u8(i * 7 + i / 512)
+        for i in 0..<bytes.len do bytes[i] = u8.wrap(i * 7 + i / 512)
         c.write_sectors(2045,bytes[..]).unwrap()
         assert(c.bus.writes == 3 && c.bus.last_write == u32(if block then 2047 else 2047 * 512))
         var out: [1536]u8
