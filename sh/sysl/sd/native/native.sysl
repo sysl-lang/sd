@@ -18,17 +18,20 @@ enum BusWidth
 
 // Controller-specific adapters implement bounded commands and data transfers.
 // R2 replies are bits 127..0, MSW first, as in STM32 SDMMC RESP1..RESP4.
-// Data callbacks issue their command and report controller data errors. They
-// need not look at R1: the card reports a command's error bits in its next
-// status response, and the card checks that status after every transfer. A
-// controller failure is reported as Error.Host; a card error as
-// Error.CardStatus.
+// Data callbacks issue their command, move its data, and answer the command's
+// own R1 card status. A card refuses a data command in that R1 (OUT_OF_RANGE,
+// ADDRESS_ERROR, WP_VIOLATION and the other error bits of type R, section
+// 4.10.1) and then sends or takes no data, so a host that sees an error bit in
+// it answers the R1 at once rather than waiting out the data phase. The card
+// classifies every R1 itself, and reads the card status again after each
+// transfer for the errors found while executing it. A host reports only its
+// controller's failures, as Error.Host.
 trait Host
     max_blocks(self) -> usize = 65535
     configure(*self, hz: u32, width: BusWidth) -> Result[unit,Error]
     command(*self, index: u8, arg: u32, response: Response) -> Result[[4]u32,Error]
-    read_data(*self, index: u8, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error]
-    write_data(*self, index: u8, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[unit,Error]
+    read_data(*self, index: u8, arg: u32, out: []u8, timeout_us: u32) -> Result[u32,Error]
+    write_data(*self, index: u8, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[u32,Error]
 
 // Card status (section 4.10.1). CARD_STATUS_ERRORS is every error bit (address,
 // block length, erase, write protect, lock, CRC, illegal command, ECC, card
@@ -46,8 +49,8 @@ private const RCA: u32 = 0xffff0000
 private const FOUR_BIT_BUS: u32 = 2
 
 // The error a card status word reports, or None when no error bit is set. The
-// card applies this to every status it reads; a host only needs it to classify
-// a status word of its own.
+// card applies this to every status it reads; a host asks it whether a data
+// command's R1 refused the transfer, so that it skips the data phase.
 card_status_error(status: u32) -> Option[Error] = if status & CARD_STATUS_ERRORS != 0 then Some(Error.CardStatus(status)) else None
 
 private[native] check_status(status: u32) -> Result[unit,Error]
@@ -105,7 +108,7 @@ impl[H: Host, K: Clock] Media for Card[H,K]
         // SCR (section 5.6): structure version 1.0, and SD_BUS_WIDTHS, whose
         // bit 0 (one-bit) is mandatory and bit 2 is four-bit support.
         var scr: [8]u8
-        self.host.read_data(ACMD_SEND_SCR,0,scr[..],c.read_us)?
+        check_status(self.host.read_data(ACMD_SEND_SCR,0,scr[..],c.read_us)?)?
         if scr[0] >> 4 != 0 || scr[1] & 1 == 0 then return Err(Error.InvalidScr)
         val width = if scr[1] & 4 != 0 then BusWidth.Four else BusWidth.One
         if width == BusWidth.Four
@@ -119,13 +122,13 @@ impl[H: Host, K: Clock] Media for Card[H,K]
 
     read_sector(*self, sector: u64, out: []u8) -> Result[unit,Error]
         val address = argument(self.information(),sector,out.len)?
-        self.host.read_data(READ_SINGLE_BLOCK,address,out,self.config.read_us)?
+        check_status(self.host.read_data(READ_SINGLE_BLOCK,address,out,self.config.read_us)?)?
         read_status(self)
 
     write_sector(*self, sector: u64, bytes: []const u8) -> Result[unit,Error]
         val address = argument(self.information(),sector,bytes.len)?
         if self.info.write_protected then return Err(Error.WriteProtected)
-        self.host.write_data(WRITE_BLOCK,address,bytes,self.config.program_us)?
+        check_status(self.host.write_data(WRITE_BLOCK,address,bytes,self.config.program_us)?)?
         self.sync()
 
     // Bulk transfers are bounded by the host's data-path capacity. Each native
@@ -142,10 +145,10 @@ impl[H: Host, K: Clock] Media for Card[H,K]
             val arg = argument(self.information(),sector + u64(done),SECTOR_SIZE)?
             val into = out[done * SECTOR_SIZE..<(done + count) * SECTOR_SIZE]
             if count == 1
-                self.host.read_data(READ_SINGLE_BLOCK,arg,into,self.config.read_us)?
+                check_status(self.host.read_data(READ_SINGLE_BLOCK,arg,into,self.config.read_us)?)?
                 read_status(self)?
             else
-                finish(self.host.read_data(READ_MULTIPLE_BLOCK,arg,into,self.config.read_us),stop(self))?
+                stopped(self,self.host.read_data(READ_MULTIPLE_BLOCK,arg,into,self.config.read_us))?
                 self.sync()?
             done += count
         Ok(())
@@ -161,8 +164,8 @@ impl[H: Host, K: Clock] Media for Card[H,K]
             val count = if left > maximum then maximum else left
             val arg = argument(self.information(),sector + u64(done),SECTOR_SIZE)?
             val from = bytes[done * SECTOR_SIZE..<(done + count) * SECTOR_SIZE]
-            if count == 1 then self.host.write_data(WRITE_BLOCK,arg,from,self.config.program_us)?
-            else finish(self.host.write_data(WRITE_MULTIPLE_BLOCK,arg,from,self.config.program_us),stop(self))?
+            if count == 1 then check_status(self.host.write_data(WRITE_BLOCK,arg,from,self.config.program_us)?)?
+            else stopped(self,self.host.write_data(WRITE_MULTIPLE_BLOCK,arg,from,self.config.program_us))?
             self.sync()?
             done += count
         Ok(())
@@ -176,6 +179,14 @@ card[H: Host, K: Clock](host: H, clock: K, config: Settings = settings()) -> Car
 // Ends a multiblock run; sent whatever the transfer returned.
 private stop[H: Host, K: Clock](c: *Card[H,K]) -> Result[unit,Error]
     check_status(c.host.command(STOP_TRANSMISSION,0,Response.R1)?[0])
+
+// A multiblock run's outcome. A run the card refused in the command's R1 never
+// entered the data state, so there is nothing to stop; every other run is
+// stopped, and the transfer's own error wins over the stop's.
+private stopped[H: Host, K: Clock](c: *Card[H,K], transfer: Result[u32,Error]) -> Result[unit,Error]
+    if transfer is Ok(r1) then check_status(r1)?
+    finish(transfer,stop(c))?
+    Ok(())
 
 // Reads the card status after a single-block read, where the card reports the
 // transfer's error bits. Writes and multiblock runs are checked by `sync`.

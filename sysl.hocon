@@ -1,4 +1,4 @@
-package { name = "sd", version = "0.2.5", sysl = "0.8.0" }
+package { name = "sd", version = "0.3.0", sysl = "0.8.6" }
 optimization = "2"
 workspace = ["tools/*"]
 features { fat = [fat] }

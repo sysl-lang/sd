@@ -54,9 +54,11 @@ import sh.sysl.sd.native as native
 import sh.sysl.sd.{Error,HostError}
 extern "sd_native_configure" native_configure(hz: u32, width: u32) -> bool
 extern "sd_native_command" native_command(index: u8, arg: u32, response: u32, words: *u32) -> bool
-extern "sd_native_read" native_read(index: u8, arg: u32, bytes: *u8, count: usize) -> bool
-extern "sd_native_write" native_write(index: u8, arg: u32, bytes: *u8, count: usize) -> bool
+// A data callback stores the command's R1 in `status`.
+extern "sd_native_read" native_read(index: u8, arg: u32, bytes: *u8, count: usize, status: *u32) -> bool
+extern "sd_native_write" native_write(index: u8, arg: u32, bytes: *u8, count: usize, status: *u32) -> bool
 private done(ok: bool) -> Result[unit,Error] = if ok then Ok(()) else Err(Error.Host(HostError.Io))
+private answered(ok: bool, status: u32) -> Result[u32,Error] = if ok then Ok(status) else Err(Error.Host(HostError.Io))
 struct NativeTransport
 end NativeTransport
 impl native.Host for NativeTransport
@@ -71,8 +73,12 @@ impl native.Host for NativeTransport
             native.Response.R2 -> 3
         done(native_command(index,arg,kind,&words[0]))?
         Ok(words)
-    read_data(*self, index: u8, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error] = done(native_read(index,arg,&out[0],out.len))
-    write_data(*self, index: u8, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[unit,Error] = done(native_write(index,arg,&bytes[0],bytes.len))
+    read_data(*self, index: u8, arg: u32, out: []u8, timeout_us: u32) -> Result[u32,Error]
+        var status: u32 = 0
+        answered(native_read(index,arg,&out[0],out.len,&status),status)
+    write_data(*self, index: u8, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[u32,Error]
+        var status: u32 = 0
+        answered(native_write(index,arg,&bytes[0],bytes.len,&status),status)
 struct NativeClock
 end NativeClock
 impl Clock for NativeClock

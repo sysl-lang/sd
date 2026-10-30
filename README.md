@@ -11,7 +11,7 @@ high-speed switching are not implemented. Physical cards have not been validated
 
 ```hocon
 dependencies {
-  sd { git = "github.com/sysl-lang/sd", version = "0.2.5", features = [fat] }
+  sd { git = "github.com/sysl-lang/sd", version = "0.3.0", features = [fat] }
 }
 ```
 
@@ -75,11 +75,17 @@ do not make FAT operations atomic.
 through a controller adapter implementing the allocation-free `Host` trait:
 configure the clock and `BusWidth`, send a command expecting a `Response`
 (`Empty`, `R1`, `R2`, `R3`), and transfer command-associated data with a
-bounded timeout. R2 words are most significant first. Data callbacks report
-controller transfer errors as `Error.Host`; they need not check R1, because the
-card reads the card status after every transfer and reports an error bit as
-`Error.CardStatus`. `native.card_status_error(status)` classifies a status word
-(`CARD_STATUS_ERRORS` is the error mask) for a host that wants to. Initialization sends CMD0/8, ACMD41, CMD2/3/9/7, reads the SCR and
+bounded timeout. R2 words are most significant first. A data callback answers
+its command's own R1 card status, because that is where a card refuses a
+transfer: `OUT_OF_RANGE`, `ADDRESS_ERROR` and `WP_VIOLATION` arrive in the data
+command's R1, not in a later status read, and the card then sends or takes no
+data. So a host that finds an error bit in the R1
+(`native.card_status_error(status)`, mask `CARD_STATUS_ERRORS`) answers it at
+once instead of waiting out the data phase. The card classifies every R1 itself
+and reports an error bit as `Error.CardStatus`; it also reads the card status
+after every transfer, for errors found while executing it. A host reports only
+its controller's failures, as `Error.Host`. A multiblock run refused in its R1
+is not followed by CMD12. Initialization sends CMD0/8, ACMD41, CMD2/3/9/7, reads the SCR and
 negotiates a four-bit bus when the card has one. Host hardware checks command and
 data CRCs; the `check_crc` setting is SPI's. The adapter owns DMA/cache policy
 and arbitration.

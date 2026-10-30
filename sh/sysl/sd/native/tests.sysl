@@ -31,10 +31,16 @@ private struct Fake
     fail_data: bool
     fail_stop: bool
     bad_status: u32
+    // Error bits the card answers in a data command's own R1, refusing it.
+    refuse: u32
+    // Data commands whose data phase ran.
+    transfers: u32
     data: [4096]u8
 private fake() -> Fake = Fake(clock = 0, width = BusWidth.One, calls = 0, attempts = 0, busy = 0, not_ready = false, bad_echo = false, bad_scr = false,
     one_bit = false, protected = false, fail = false, address = 0, maximum = 65535, stops = 0, multi_reads = 0, multi_writes = 0,
-    fail_data = false, fail_stop = false, bad_status = 0, data = [0;4096])
+    fail_data = false, fail_stop = false, bad_status = 0, refuse = 0, transfers = 0, data = [0;4096])
+// A data command's R1 in the transfer state, ready for data.
+private const TRAN_R1: u32 = 0x900
 impl Host for Fake
     override max_blocks(self) -> usize = self.maximum
     configure(*self, hz: u32, width: BusWidth) -> Result[unit,Error]
@@ -76,9 +82,12 @@ impl Host for Fake
                 out[0] |= self.bad_status
             _ -> assert(false,s"unexpected native command $index")
         Ok(out)
-    read_data(*self, index: u8, arg: u32, out: []u8, timeout_us: u32) -> Result[unit,Error]
+    read_data(*self, index: u8, arg: u32, out: []u8, timeout_us: u32) -> Result[u32,Error]
         if index == 18 then self.multi_reads += 1
         if self.fail then return Err(Error.Host(HostError.Io))
+        // A refused command: the R1 carries the error and no data follows.
+        if self.refuse != 0 then return Ok(TRAN_R1 | self.refuse)
+        self.transfers += 1
         if self.fail_data then return Err(Error.Host(HostError.DataCrc))
         if index == 51
             assert(out.len == 8)
@@ -89,16 +98,18 @@ impl Host for Fake
             assert((index == 17 || index == 18) && out.len % 512 == 0)
             self.address = arg
             for i in 0..<out.len do out[i] = self.data[usize(arg % 8) * 512 + i]
-        Ok(())
-    write_data(*self, index: u8, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[unit,Error]
+        Ok(TRAN_R1)
+    write_data(*self, index: u8, arg: u32, bytes: []const u8, timeout_us: u32) -> Result[u32,Error]
         assert((index == 24 || index == 25) && bytes.len % 512 == 0)
         if index == 25 then self.multi_writes += 1
         if self.fail then return Err(Error.Host(HostError.Io))
+        if self.refuse != 0 then return Ok(TRAN_R1 | self.refuse)
+        self.transfers += 1
         if self.fail_data then return Err(Error.Host(HostError.Underrun))
         self.address = arg
         for i in 0..<bytes.len do self.data[usize(arg % 8) * 512 + i] = bytes[i]
         self.busy = 2
-        Ok(())
+        Ok(TRAN_R1)
 
 @test("native SD: initialization assigns RCA, parses CSD/SCR and negotiates four-bit transfer speed")
 initialize_native()
@@ -187,7 +198,61 @@ card_status_error_native()
     for bit in [31u32,30,29,28,27,26,24,23,22,21,20,19,18,17,16,15,14,13,3]
         assert(card_status_error(0x900 | (1 << bit)) == Some(Error.CardStatus(0x900 | (1 << bit))))
 
-@test("native SD: error bits in the card status reach the caller without the host checking R1, on every data path")
+// OUT_OF_RANGE, ADDRESS_ERROR and WP_VIOLATION: error bits a card answers in
+// the data command's own R1.
+private const OUT_OF_RANGE: u32 = 1 << 31
+private const ADDRESS_ERROR: u32 = 1 << 30
+private const WP_VIOLATION: u32 = 1 << 26
+
+private refusing(bits: u32) -> Card[Fake,Ticker]
+    var c = card(fake(),ticker())
+    c.initialize().unwrap()
+    c.host.refuse = bits
+    c
+
+@test("native SD refusals: a read refused in its own R1 is that card status, with no data and no stop")
+refused_read_native()
+    var out: [1024]u8 = [0x5a;1024]
+    var c = refusing(OUT_OF_RANGE)
+    val calls = c.host.calls
+    assert(c.read_sector(0,out[..<512]).err() == Some(Error.CardStatus(TRAN_R1 | OUT_OF_RANGE)))
+    assert(c.read_sectors(0,out[..<512]).err() == Some(Error.CardStatus(TRAN_R1 | OUT_OF_RANGE)))
+    assert(c.host.calls == calls)
+    c.host.refuse = ADDRESS_ERROR
+    assert(c.read_sectors(0,out[..]).err() == Some(Error.CardStatus(TRAN_R1 | ADDRESS_ERROR)))
+    assert(c.host.calls == calls && c.host.multi_reads == 1 && c.host.stops == 0 && c.host.transfers == 1)
+    for i in 0..<1024 do assert(out[i] == 0x5a)
+    c.host.refuse = 0
+    c.read_sectors(0,out[..]).unwrap()
+    assert(c.host.stops == 1)
+
+@test("native SD refusals: a write refused in its own R1 is that card status, with no programming wait and no stop")
+refused_write_native()
+    val bytes: [1024]u8 = [0xa5;1024]
+    var c = refusing(WP_VIOLATION)
+    val calls = c.host.calls
+    assert(c.write_sector(0,bytes[..<512]).err() == Some(Error.CardStatus(TRAN_R1 | WP_VIOLATION)))
+    assert(c.write_sectors(0,bytes[..<512]).err() == Some(Error.CardStatus(TRAN_R1 | WP_VIOLATION)))
+    assert(c.write_sectors(0,bytes[..]).err() == Some(Error.CardStatus(TRAN_R1 | WP_VIOLATION)))
+    assert(c.host.calls == calls && c.host.stops == 0 && c.host.multi_writes == 1 && c.host.transfers == 1)
+    for i in 0..<1024 do assert(c.host.data[i] == 0)
+
+@test("native SD refusals: an SCR read refused in its own R1 fails initialization with that status")
+refused_scr_native()
+    var b = fake()
+    b.refuse = ADDRESS_ERROR
+    var c = card(b,ticker())
+    assert(c.initialize().err() == Some(Error.CardStatus(TRAN_R1 | ADDRESS_ERROR)) && c.information().is_none())
+    assert(c.host.transfers == 0)
+
+@test("native SD refusals: state bits alone in a data command's R1 are no error")
+r1_state_bits_native()
+    var c = refusing(0)
+    var out: [512]u8
+    c.read_sector(0,out[..]).unwrap()
+    c.write_sector(0,out[..]).unwrap()
+
+@test("native SD: error bits found while executing a transfer reach the caller through the status read after it, on every data path")
 card_status_without_host_native()
     val bits = 1u32 << 31
     var bytes: [1024]u8 = [0;1024]
