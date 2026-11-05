@@ -11,7 +11,7 @@ high-speed switching are not implemented. Physical cards have not been validated
 
 ```hocon
 dependencies {
-  sd { git = "github.com/sysl-lang/sd", version = "0.3.0", features = [fat] }
+  sd { git = "github.com/sysl-lang/sd", version = "0.3.1", features = [fat] }
 }
 ```
 

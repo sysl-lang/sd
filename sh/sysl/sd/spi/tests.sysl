@@ -244,7 +244,7 @@ impl Device for Fake
             if self.write_count == 514
                 assert(((u16(self.write_data[512]) << 8) | u16(self.write_data[513])) == ref_crc(self.write_data[..<512]),"write data CRC must be valid")
                 if self.reject == 5
-                    for i in 0usize..<512 do self.storage.set(usize(self.write_at) + i,self.write_data[i])
+                    for i in 0usize..<512 do self.storage[usize(self.write_at) + i] = self.write_data[i]
                     self.busy = 2
                     self.programming = true
                 self.reply_at = 0
